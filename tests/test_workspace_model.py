@@ -448,6 +448,36 @@ class WorkspaceModelContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "symlink"):
                 load_workspace(workspace)
 
+    def test_loader_rejects_canonical_task_and_adopted_material_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / ".workspace-organizer").mkdir()
+            bundle = workspace / "20_任务" / "research-agent-safety"
+            bundle.mkdir(parents=True)
+            source = WORKSPACE / "20_任务" / "research-agent-safety" / "TASK.md"
+            (bundle / "TASK.md").write_text(
+                source.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            config = {
+                "schema_version": 1,
+                "workspace_id": "canonical-overlap-test",
+                "default_sensitivity": "internal",
+                "adopted_task_paths": [],
+                "adopted_material_roots": [
+                    {
+                        "path": "20_任务/research-agent-safety/inputs",
+                        "sensitivity": "public",
+                    }
+                ],
+                "exclude_paths": [],
+            }
+            (workspace / ".workspace-organizer" / "config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ContractError, "task and material"):
+                load_workspace(workspace)
+
     def test_loader_skips_excluded_and_nested_git_tasks_before_reading(self) -> None:
         for boundary in ("excluded", "nested-git"):
             with self.subTest(boundary=boundary):

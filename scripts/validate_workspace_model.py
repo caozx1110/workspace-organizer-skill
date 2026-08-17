@@ -531,6 +531,7 @@ def load_workspace(root: Path) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str
     records: List[Tuple[str, Dict[str, Any]]] = []
     seen_ids: Dict[str, str] = {}
     seen_paths: List[str] = []
+    task_bundle_paths: List[str] = []
     for task_path, location in task_paths:
         relative = _relative_to(root, task_path)
         task_path = _safe_existing_file(root, relative)
@@ -565,9 +566,20 @@ def load_workspace(root: Path) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str
                 or path_id != task_id
             ):
                 raise _error(relative, "archive path must derive from closed_at, area, and ID")
+        if location in {"active", "adopted"}:
+            task_bundle_paths.append(PurePosixPath(relative).parent.as_posix())
         records.append((relative, data))
 
     _reject_normalized_duplicates(seen_paths, "task record paths")
+    for task_root in task_bundle_paths:
+        for declaration in config["adopted_material_roots"]:
+            material_root = declaration["path"]
+            if _paths_overlap(task_root, material_root):
+                raise _error(
+                    ".workspace-organizer/config.json",
+                    "task and material roots must not overlap: "
+                    f"{task_root!r} and {material_root!r}",
+                )
     return config, records
 
 
