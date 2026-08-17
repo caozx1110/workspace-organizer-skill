@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "view": "timeline",
+  "profile": "default",
+  "source_sha256": "6145ea8ed7a7db375a277e955183981ef2e1ac5dbc015a5ce8352c9ef3853757",
+  "items": [
+    {
+      "date": "2026-08-22",
+      "event": "due",
+      "id": "presentation-quarterly-update",
+      "title": "Prepare the quarterly update",
+      "status": "planned",
+      "priority": "urgent",
+      "sensitivity": "public",
+      "record": "20_任务/presentation-quarterly-update/TASK.md"
+    },
+    {
+      "date": "2026-09-30",
+      "event": "due",
+      "id": "research-agent-safety",
+      "title": "Survey safe agent evaluation",
+      "status": "active",
+      "priority": "high",
+      "sensitivity": "internal",
+      "record": "20_任务/research-agent-safety/TASK.md"
+    },
+    {
+      "date": "2026-10-01",
+      "event": "due",
+      "id": "competition-robotics",
+      "title": "Submit the robotics challenge entry",
+      "status": "blocked",
+      "priority": "high",
+      "sensitivity": "internal",
+      "record": "20_任务/competition-robotics/TASK.md"
+    }
+  ]
+}

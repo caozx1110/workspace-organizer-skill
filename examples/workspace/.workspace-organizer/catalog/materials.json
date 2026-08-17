@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "view": "materials",
+  "profile": "default",
+  "source_sha256": "29056a2248ab1be39c9e21005c622a70fc48a7398622d4ba917ad3f0ac036879",
+  "items": [
+    {
+      "path": "20_任务/collaboration-dataset/records/meeting-notes.md",
+      "role": "records",
+      "task_id": "collaboration-dataset",
+      "sensitivity": "internal",
+      "bytes": 77,
+      "sha256": "49c0ce117101fad6cb1b7ae488fe67f890611c68e1c4a425e35706f8adb69558"
+    },
+    {
+      "path": "20_任务/competition-robotics/work/submission-notes.md",
+      "role": "work",
+      "task_id": "competition-robotics",
+      "sensitivity": "internal",
+      "bytes": 73,
+      "sha256": "1f62792b9c609eef73f5775a748bb980aed877dc2d87cf8ae18ea3e528d4991c"
+    },
+    {
+      "path": "20_任务/presentation-quarterly-update/deliverables/outline.md",
+      "role": "deliverables",
+      "task_id": "presentation-quarterly-update",
+      "sensitivity": "public",
+      "bytes": 57,
+      "sha256": "55de0f5a1775d2e172c505eb2cf1baa92232b1cd405805cc851e189206e09c53"
+    },
+    {
+      "path": "20_任务/research-agent-safety/inputs/research-question.md",
+      "role": "inputs",
+      "task_id": "research-agent-safety",
+      "sensitivity": "internal",
+      "bytes": 83,
+      "sha256": "cda16a1e0a8c90725ecb53d33f0e45239575a1ed2c66ac5a8e52d36419425e8f"
+    },
+    {
+      "path": "30_资料库/templates/meeting-agenda.md",
+      "role": "library",
+      "task_id": null,
+      "sensitivity": "internal",
+      "bytes": 70,
+      "sha256": "e43adcfe3e0a3718749b455756ef04f0a5a9a0a4165ca80740bf54f85edc73ec"
+    },
+    {
+      "path": "Legacy Library/general/reference-note.md",
+      "role": "library",
+      "task_id": null,
+      "sensitivity": "internal",
+      "bytes": 96,
+      "sha256": "eef8a2e26524f19d6d2ff388ee78f678a092e992d3ce4006b5bd8776826b1007"
+    }
+  ]
+}

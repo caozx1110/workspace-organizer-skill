@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "workspace_id": "contract-example",
+  "default_sensitivity": "internal",
+  "adopted_task_paths": [],
+  "adopted_material_roots": [
+    {
+      "path": "Legacy Library",
+      "sensitivity": "public"
+    },
+    {
+      "path": "Legacy Library/Restricted",
+      "sensitivity": "restricted"
+    }
+  ],
+  "exclude_paths": []
+}

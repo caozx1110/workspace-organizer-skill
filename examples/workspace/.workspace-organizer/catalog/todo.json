@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "view": "todo",
+  "profile": "default",
+  "source_sha256": "71c71cf6a940eb0942c1ef26957f40870bbd2e74422c143db3a263adb8e5fabc",
+  "items": [
+    {
+      "id": "presentation-quarterly-update",
+      "title": "Prepare the quarterly update",
+      "status": "planned",
+      "priority": "urgent",
+      "due": "2026-08-22",
+      "sensitivity": "public",
+      "next_action": "Draft the three-slide narrative",
+      "record": "20_任务/presentation-quarterly-update/TASK.md"
+    },
+    {
+      "id": "research-agent-safety",
+      "title": "Survey safe agent evaluation",
+      "status": "active",
+      "priority": "high",
+      "due": "2026-09-30",
+      "sensitivity": "internal",
+      "next_action": "Compare the retained benchmark protocols",
+      "record": "20_任务/research-agent-safety/TASK.md"
+    },
+    {
+      "id": "competition-robotics",
+      "title": "Submit the robotics challenge entry",
+      "status": "blocked",
+      "priority": "high",
+      "due": "2026-10-01",
+      "sensitivity": "internal",
+      "next_action": "Resolve the missing eligibility evidence",
+      "record": "20_任务/competition-robotics/TASK.md"
+    },
+    {
+      "id": "collaboration-dataset",
+      "title": "Coordinate the shared dataset handoff",
+      "status": "active",
+      "priority": "normal",
+      "due": null,
+      "sensitivity": "internal",
+      "next_action": "Confirm the public field list with the partner",
+      "record": "20_任务/collaboration-dataset/TASK.md"
+    }
+  ]
+}

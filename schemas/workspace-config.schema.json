@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/caozx1110/workspace-organizer-skill/schemas/workspace-config.schema.json",
+  "title": "workspace-organizer configuration v1",
+  "$comment": "Cross-entry overlap, exclusion, and sensitivity-precedence rules are enforced by the read-only contract validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workspace_id",
+    "default_sensitivity",
+    "adopted_task_paths",
+    "adopted_material_roots",
+    "exclude_paths"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "workspace_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "default_sensitivity": {
+      "$ref": "#/$defs/sensitivity",
+      "description": "The minimum sensitivity for reusable and adopted material; declarations can only make a path more restrictive."
+    },
+    "adopted_task_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Exact, pairwise-disjoint task bundle roots. They must not overlap adopted material roots or be contained by an exclusion.",
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      }
+    },
+    "adopted_material_roots": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Exact material roots. Nested roots are allowed only within this same ownership class; effective sensitivity is the most restrictive of the default and every containing declaration.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "sensitivity"
+        ],
+        "properties": {
+          "path": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "sensitivity": {
+            "$ref": "#/$defs/sensitivity"
+          }
+        }
+      }
+    },
+    "exclude_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Pairwise-disjoint roots that no loader or indexer may enter. A strict descendant may carve content out of a registered root; a registered root cannot be inside an exclusion.",
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      }
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000)(?!.*/$).+$"
+    },
+    "sensitivity": {
+      "enum": [
+        "public",
+        "internal",
+        "confidential",
+        "restricted"
+      ]
+    }
+  }
+}
