@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sys
+import tempfile
 import unicodedata
 import unittest
 from pathlib import Path
@@ -20,6 +21,8 @@ from validate_workspace_model import (  # noqa: E402
     OPEN_STATUSES,
     PRIORITIES,
     ContractError,
+    effective_material_sensitivity,
+    is_excluded_path,
     load_json,
     load_workspace,
     validate_config,
@@ -152,17 +155,39 @@ def build_materials(
             if not role_root.is_dir():
                 continue
             for path in sorted(role_root.rglob("*"), key=lambda item: item.as_posix()):
-                if path.is_file() and not path.is_symlink():
+                relative = path.relative_to(WORKSPACE).as_posix()
+                if (
+                    path.is_file()
+                    and not path.is_symlink()
+                    and not is_excluded_path(relative, config)
+                ):
                     items.append(
                         _material_item(path, role, task["id"], task["sensitivity"])
                     )
 
-    library_root = WORKSPACE / "30_资料库"
-    if config["default_sensitivity"] in VISIBLE_SENSITIVITIES:
+    library_roots = [WORKSPACE / "30_资料库"] + [
+        WORKSPACE.joinpath(*Path(item["path"]).parts)
+        for item in config["adopted_material_roots"]
+    ]
+    seen_library_paths = set()
+    for library_root in library_roots:
+        if not library_root.is_dir() or library_root.is_symlink():
+            continue
         for path in sorted(library_root.rglob("*"), key=lambda item: item.as_posix()):
-            if path.is_file() and not path.is_symlink():
+            relative = path.relative_to(WORKSPACE).as_posix()
+            if relative in seen_library_paths:
+                continue
+            seen_library_paths.add(relative)
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not is_excluded_path(relative, config)
+            ):
+                sensitivity = effective_material_sensitivity(relative, config)
+                if sensitivity not in VISIBLE_SENSITIVITIES:
+                    continue
                 items.append(
-                    _material_item(path, "library", None, config["default_sensitivity"])
+                    _material_item(path, "library", None, sensitivity)
                 )
 
     items.sort(key=lambda item: unicodedata.normalize("NFC", item["path"]))
@@ -341,6 +366,145 @@ class WorkspaceModelContractTests(unittest.TestCase):
                 with self.assertRaises(ContractError):
                     validate_relative_path(invalid, "invalid")
 
+    def test_material_sensitivity_uses_the_most_restrictive_declaration(self) -> None:
+        self.assertEqual(
+            effective_material_sensitivity(
+                "Legacy Library/general/reference-note.md", self.config
+            ),
+            "internal",
+        )
+        self.assertEqual(
+            effective_material_sensitivity(
+                "Legacy Library/Restricted/hidden-note.md", self.config
+            ),
+            "restricted",
+        )
+
+    def test_configuration_rejects_ambiguous_path_overlap(self) -> None:
+        base = {
+            "schema_version": 1,
+            "workspace_id": "overlap-test",
+            "default_sensitivity": "internal",
+            "adopted_task_paths": [],
+            "adopted_material_roots": [],
+            "exclude_paths": [],
+        }
+        invalid_cases = [
+            {
+                "adopted_task_paths": ["Tasks/Alpha", "Tasks/Alpha/Nested"],
+            },
+            {
+                "adopted_task_paths": ["Tasks/Alpha"],
+                "adopted_material_roots": [
+                    {"path": "Tasks/Alpha/References", "sensitivity": "internal"}
+                ],
+            },
+            {
+                "adopted_task_paths": ["Tasks/Alpha"],
+                "exclude_paths": ["Tasks"],
+            },
+            {
+                "exclude_paths": ["Private", "Private/Nested"],
+            },
+        ]
+        for overrides in invalid_cases:
+            with self.subTest(overrides=overrides):
+                config = copy.deepcopy(base)
+                config.update(overrides)
+                with self.assertRaises(ContractError):
+                    validate_config(config, "overlap-test")
+
+        nested_materials = copy.deepcopy(base)
+        nested_materials["adopted_material_roots"] = [
+            {"path": "Library", "sensitivity": "public"},
+            {"path": "Library/Restricted", "sensitivity": "restricted"},
+        ]
+        nested_materials["exclude_paths"] = ["Library/Generated"]
+        validate_config(nested_materials, "nested-materials")
+
+    def test_loader_rejects_symlink_escape_before_reading_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            workspace = parent / "workspace"
+            outside = parent / "outside"
+            (workspace / ".workspace-organizer").mkdir(parents=True)
+            outside.mkdir()
+            (outside / "TASK.md").write_text("invalid", encoding="utf-8")
+            (workspace / "External Task").symlink_to(
+                outside, target_is_directory=True
+            )
+            config = {
+                "schema_version": 1,
+                "workspace_id": "symlink-test",
+                "default_sensitivity": "internal",
+                "adopted_task_paths": ["External Task"],
+                "adopted_material_roots": [],
+                "exclude_paths": [],
+            }
+            (workspace / ".workspace-organizer" / "config.json").write_text(
+                json.dumps(config), encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ContractError, "symlink"):
+                load_workspace(workspace)
+
+    def test_loader_skips_excluded_and_nested_git_tasks_before_reading(self) -> None:
+        for boundary in ("excluded", "nested-git"):
+            with self.subTest(boundary=boundary):
+                with tempfile.TemporaryDirectory() as temporary:
+                    workspace = Path(temporary)
+                    (workspace / ".workspace-organizer").mkdir()
+                    bundle = workspace / "20_任务" / boundary
+                    bundle.mkdir(parents=True)
+                    (bundle / "TASK.md").write_text("invalid", encoding="utf-8")
+                    if boundary == "nested-git":
+                        (bundle / ".git").mkdir()
+                    config = {
+                        "schema_version": 1,
+                        "workspace_id": "boundary-test",
+                        "default_sensitivity": "internal",
+                        "adopted_task_paths": [],
+                        "adopted_material_roots": [],
+                        "exclude_paths": (
+                            [f"20_任务/{boundary}"]
+                            if boundary == "excluded"
+                            else []
+                        ),
+                    }
+                    (workspace / ".workspace-organizer" / "config.json").write_text(
+                        json.dumps(config), encoding="utf-8"
+                    )
+
+                    _, records = load_workspace(workspace)
+                    self.assertEqual(records, [])
+
+    def test_relative_path_schemas_match_the_python_validator(self) -> None:
+        config_schema = load_json(REPO_ROOT / "schemas/workspace-config.schema.json")
+        view_schema = load_json(REPO_ROOT / "schemas/generated-view.schema.json")
+        config_pattern = config_schema["$defs"]["relativePath"]["pattern"]
+        view_pattern = view_schema["$defs"]["relativePath"]["pattern"]
+        self.assertEqual(config_pattern, view_pattern)
+
+        probes = {
+            "valid/path": True,
+            "trailing/": False,
+            "empty//segment": False,
+            "backslash\\segment": False,
+            "dot/./segment": False,
+            "parent/../segment": False,
+            "nul\x00segment": False,
+        }
+        compiled = re.compile(config_pattern)
+        for value, expected in probes.items():
+            with self.subTest(value=value):
+                self.assertEqual(compiled.fullmatch(value) is not None, expected)
+                try:
+                    validate_relative_path(value, "probe")
+                    accepted = True
+                except ContractError:
+                    accepted = False
+                self.assertEqual(accepted, expected)
+
     def test_invalid_task_records_fail_closed(self) -> None:
         _, source = self.records[0]
         cases = []
@@ -439,6 +603,7 @@ class WorkspaceModelContractTests(unittest.TestCase):
             "synthetic-receipt.txt",
             "contract-vendor-renewal",
             "terms-summary.md",
+            "hidden-note.md",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, output)

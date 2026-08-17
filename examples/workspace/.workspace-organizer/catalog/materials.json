@@ -2,7 +2,7 @@
   "schema_version": 1,
   "view": "materials",
   "profile": "default",
-  "source_sha256": "d514f9a9c9d5b052e9a3fe0cf09c8f83634bde991350899edd328fcba9a6f590",
+  "source_sha256": "29056a2248ab1be39c9e21005c622a70fc48a7398622d4ba917ad3f0ac036879",
   "items": [
     {
       "path": "20_任务/collaboration-dataset/records/meeting-notes.md",
@@ -43,6 +43,14 @@
       "sensitivity": "internal",
       "bytes": 70,
       "sha256": "e43adcfe3e0a3718749b455756ef04f0a5a9a0a4165ca80740bf54f85edc73ec"
+    },
+    {
+      "path": "Legacy Library/general/reference-note.md",
+      "role": "library",
+      "task_id": null,
+      "sensitivity": "internal",
+      "bytes": 96,
+      "sha256": "eef8a2e26524f19d6d2ff388ee78f678a092e992d3ce4006b5bd8776826b1007"
     }
   ]
 }

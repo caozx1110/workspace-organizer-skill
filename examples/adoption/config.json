@@ -8,7 +8,11 @@
   "adopted_material_roots": [
     {
       "path": "Reference Library/共享资料",
-      "sensitivity": "internal"
+      "sensitivity": "public"
+    },
+    {
+      "path": "Reference Library/共享资料/受限",
+      "sensitivity": "restricted"
     }
   ],
   "exclude_paths": [

@@ -66,7 +66,18 @@ different explicit value. `adopted_task_paths` lists exact bundle roots, never
 search roots. `adopted_material_roots` classifies exact inventory roots without
 making them tasks. `exclude_paths` lists exact roots that tools must not enter.
 Built-in exclusions (`.git/`, every nested Git repository,
-`.workspace-organizer/cache/`, and symlink targets) apply even when not listed.
+`.workspace-organizer/cache/`, and every symlink component or target) apply even
+when not listed.
+
+Configuration path relationships are compared after NFC normalization and
+case-folding. Adopted task roots are pairwise disjoint and MUST NOT overlap an
+adopted material root. Exact duplicate material roots are invalid; nested
+material roots are allowed only because they retain the same material ownership
+and can make a subtree more restrictive. Exclusion roots are pairwise disjoint.
+An exclusion MAY be a strict descendant of a task or material root as an
+explicit carve-out, but a registered root MUST NOT equal or sit below an
+exclusion. These rules reject ambiguous ownership before any registered path is
+read.
 
 ## 3. Task bundles and stable identity
 
@@ -228,6 +239,14 @@ default overview. A duplicate ID, invalid record, missing adopted path, path
 escape, or normalized collision is a validation error. A generator MUST leave
 all existing generated files unchanged rather than publish a partial refresh.
 
+Before reading any `TASK.md`, a conforming loader validates the lexical relative
+path, rejects a symlink in any component or at the file, resolves the regular
+file strictly inside the resolved workspace root, and checks exclusions and
+nested Git boundaries. Canonical or archived candidates under `exclude_paths`
+or a nested Git repository are ignored without reading them. An explicitly
+registered adopted task under either boundary is a configuration error rather
+than a silently missing task.
+
 The default projection is fixed to `public` and `internal` tasks. Filtering
 happens before sorting and hashing. `confidential`, `restricted`, missing,
 unknown, or malformed sensitivity never contributes text, paths, counts, or a
@@ -286,14 +305,18 @@ under `30_资料库/` and confirmed `adopted_material_roots`. It excludes
 `99_待整理/`, `90_归档/`, generated views, the control plane, VCS boundaries,
 symlinks, sockets, devices, and anything under an excluded path.
 
-Task material inherits the task sensitivity. Library material inherits
-`default_sensitivity`; an adopted material root uses its explicit sensitivity.
-Apply the default sensitivity filter to the inherited value before adding a
-path or digest. An item contains the workspace-relative path, role, owning task
-ID or `null`, sensitivity, byte size, and lowercase SHA-256 content digest.
-Sort by normalized path code point order. `MATERIALS.md` has the marker,
-`# Materials`, and columns `Role`, `Task`, `Material`, `Bytes`, and `SHA-256`.
-The material link uses the same percent-encoding rule as task links.
+Task material inherits the task sensitivity. For library and adopted material,
+start with `default_sensitivity`, collect every `adopted_material_roots`
+declaration whose root contains the file, and choose the most restrictive value
+using `public < internal < confidential < restricted`. Therefore a `public`
+adopted declaration cannot downgrade an `internal` default, while a nested
+`restricted` declaration excludes its subtree. Apply the default sensitivity
+filter only after this reduction. An item contains the workspace-relative path,
+role, owning task ID or `null`, effective sensitivity, byte size, and lowercase
+SHA-256 content digest. Sort by normalized path code point order.
+`MATERIALS.md` has the marker, `# Materials`, and columns `Role`, `Task`,
+`Material`, `Bytes`, and `SHA-256`. The material link uses the same
+percent-encoding rule as task links.
 
 For every Markdown table, replace `\\` with `\\\\`, `|` with `\\|`, and a
 line break with one space in human text. Machine catalogs remain the primary
@@ -310,6 +333,11 @@ paths:
 | `internal` | May appear in the local default projection; MUST NOT be treated as publishable. This is the new-record default. |
 | `confidential` | Excluded from every default generated view and dashboard input. |
 | `restricted` | Excluded from every default generated view and used for unclassified or unknown material. |
+
+The order in this table is normative from least to most restrictive. Whenever
+multiple declarations apply to the same non-task material, the effective value
+is their maximum. Configuration never uses last-entry-wins or a longest-prefix
+override, and no declaration can reduce an inherited restriction.
 
 The task body and file contents are never copied into generated views.
 `next_action` and material filenames are considered sensitive metadata and are
@@ -328,14 +356,17 @@ Adoption does not mean immediate normalization. It has ordered gates:
 
 1. **Read-only inventory.** Identify entries, managed-name collisions,
    symlinks, VCS boundaries, normalized collisions, and candidate task roots.
-   Do not follow links or nested repositories and do not infer task ownership.
+   Resolve every candidate within the workspace; do not follow links or enter
+   excluded paths or nested repositories, and do not infer task ownership.
 2. **Confirm the workspace root.** With explicit approval, create the control
    configuration and only missing, collision-free managed directories. Existing
    entries are not overwritten or reinterpreted silently.
 3. **Register exact roots.** A person selects existing task bundles and material
    roots. Add a valid `TASK.md` to each accepted task root and list that exact
    relative root in `adopted_task_paths`; classify material roots explicitly.
-   Inventory candidates that are not selected remain unmanaged.
+   Reject ambiguous task/material/exclusion overlap. Nested material roots may
+   only tighten sensitivity through the most-restrictive rule. Inventory
+   candidates that are not selected remain unmanaged.
 4. **Generate only safe projections.** Apply schema, uniqueness, path, and
    sensitivity checks. An existing unmarked overview file blocks generation.
 5. **Propose optional migrations separately.** Any rename, move, role
@@ -358,8 +389,8 @@ verify before registration; after registration the only normal move is archive.
 [`examples/workspace/`](../examples/workspace/) contains seven synthetic task
 families, safe sample materials, configuration, and golden generated catalogs
 and Markdown views. [`examples/adoption/config.json`](../examples/adoption/config.json)
-demonstrates exact Unicode and space-containing adopted paths without moving
-anything.
+demonstrates exact Unicode and space-containing adopted paths plus nested
+material sensitivity declarations without moving anything.
 
 Run these dependency-free checks from the repository root:
 

@@ -66,6 +66,10 @@ PRIORITIES = {"urgent", "high", "normal", "low"}
 PRIORITY_ORDER = ("urgent", "high", "normal", "low")
 PRIORITY_RANK = {value: index for index, value in enumerate(PRIORITY_ORDER)}
 SENSITIVITIES = {"public", "internal", "confidential", "restricted"}
+SENSITIVITY_ORDER = ("public", "internal", "confidential", "restricted")
+SENSITIVITY_RANK = {
+    value: index for index, value in enumerate(SENSITIVITY_ORDER)
+}
 VISIBLE_SENSITIVITIES = {"public", "internal"}
 MATERIAL_ROLES = {
     "inputs",
@@ -290,6 +294,50 @@ def _reject_normalized_duplicates(values: Iterable[str], context: str) -> None:
         seen[key] = value
 
 
+def _normalized_path_parts(value: str) -> Tuple[str, ...]:
+    return tuple(
+        unicodedata.normalize("NFC", part).casefold() for part in value.split("/")
+    )
+
+
+def _path_contains(root: str, candidate: str) -> bool:
+    root_parts = _normalized_path_parts(root)
+    candidate_parts = _normalized_path_parts(candidate)
+    return (
+        len(root_parts) <= len(candidate_parts)
+        and candidate_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    return _path_contains(left, right) or _path_contains(right, left)
+
+
+def _reject_overlaps(values: Sequence[str], context: str) -> None:
+    for index, left in enumerate(values):
+        for right in values[index + 1 :]:
+            if _paths_overlap(left, right):
+                raise _error(context, f"overlapping paths {left!r} and {right!r}")
+
+
+def is_excluded_path(relative: str, config: Mapping[str, Any]) -> bool:
+    validate_relative_path(relative, "candidate path")
+    return any(_path_contains(excluded, relative) for excluded in config["exclude_paths"])
+
+
+def effective_material_sensitivity(
+    relative: str, config: Mapping[str, Any]
+) -> str:
+    """Return the most restrictive sensitivity that applies to a material path."""
+
+    validate_relative_path(relative, "material path")
+    applicable = [config["default_sensitivity"]]
+    for declaration in config["adopted_material_roots"]:
+        if _path_contains(declaration["path"], relative):
+            applicable.append(declaration["sensitivity"])
+    return max(applicable, key=lambda value: SENSITIVITY_RANK[value])
+
+
 def validate_config(data: Mapping[str, Any], context: str = "config.json") -> None:
     keys = set(data)
     missing = sorted(CONFIG_REQUIRED - keys)
@@ -317,24 +365,55 @@ def validate_config(data: Mapping[str, Any], context: str = "config.json") -> No
     if not isinstance(excluded, list):
         raise _error(f"{context}.exclude_paths", "must be an array")
 
-    all_paths: List[str] = []
+    task_paths: List[str] = []
+    material_paths: List[str] = []
+    excluded_paths: List[str] = []
     for index, value in enumerate(adopted_tasks):
-        all_paths.append(
+        task_paths.append(
             validate_relative_path(value, f"{context}.adopted_task_paths[{index}]")
         )
     for index, item in enumerate(material_roots):
         item_context = f"{context}.adopted_material_roots[{index}]"
         if not isinstance(item, dict) or set(item) != {"path", "sensitivity"}:
             raise _error(item_context, "must contain only path and sensitivity")
-        all_paths.append(validate_relative_path(item["path"], f"{item_context}.path"))
+        material_paths.append(
+            validate_relative_path(item["path"], f"{item_context}.path")
+        )
         if (
             not isinstance(item["sensitivity"], str)
             or item["sensitivity"] not in SENSITIVITIES
         ):
             raise _error(f"{item_context}.sensitivity", "has an unknown value")
     for index, value in enumerate(excluded):
-        all_paths.append(validate_relative_path(value, f"{context}.exclude_paths[{index}]"))
-    _reject_normalized_duplicates(all_paths, context)
+        excluded_paths.append(
+            validate_relative_path(value, f"{context}.exclude_paths[{index}]")
+        )
+
+    _reject_normalized_duplicates(task_paths, f"{context}.adopted_task_paths")
+    _reject_normalized_duplicates(
+        material_paths, f"{context}.adopted_material_roots"
+    )
+    _reject_normalized_duplicates(excluded_paths, f"{context}.exclude_paths")
+    _reject_overlaps(task_paths, f"{context}.adopted_task_paths")
+    _reject_overlaps(excluded_paths, f"{context}.exclude_paths")
+
+    for task_path in task_paths:
+        for material_path in material_paths:
+            if _paths_overlap(task_path, material_path):
+                raise _error(
+                    context,
+                    "adopted task and material roots must not overlap: "
+                    f"{task_path!r} and {material_path!r}",
+                )
+
+    for registered_path in task_paths + material_paths:
+        for excluded_path in excluded_paths:
+            if _path_contains(excluded_path, registered_path):
+                raise _error(
+                    context,
+                    f"registered root {registered_path!r} is inside excluded root "
+                    f"{excluded_path!r}",
+                )
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -351,29 +430,92 @@ def _relative_to(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def _resolve_workspace_root(root: Path) -> Path:
+    lexical_root = root.absolute()
+    if lexical_root.is_symlink():
+        raise _error(str(root), "workspace root must not be a symlink")
+    try:
+        resolved = lexical_root.resolve(strict=True)
+    except OSError as exc:
+        raise _error(str(root), f"workspace root cannot be resolved: {exc}") from exc
+    if not resolved.is_dir():
+        raise _error(str(root), "workspace root must be a directory")
+    return resolved
+
+
+def _safe_existing_file(root: Path, relative: str) -> Path:
+    validate_relative_path(relative, relative)
+    candidate = root.joinpath(*PurePosixPath(relative).parts)
+    current = root
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise _error(relative, "symlink components and targets are not allowed")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise _error(relative, f"required file cannot be resolved: {exc}") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise _error(relative, "resolved path escapes the workspace") from exc
+    if not resolved.is_file():
+        raise _error(relative, "must resolve to a regular file")
+    return candidate
+
+
+def _has_nested_git_boundary(root: Path, directory: Path) -> bool:
+    try:
+        directory.relative_to(root)
+    except ValueError as exc:
+        raise _error(str(directory), "path escapes the workspace") from exc
+    current = directory
+    while current != root:
+        marker = current / ".git"
+        if marker.is_symlink() or marker.exists():
+            return True
+        current = current.parent
+    return False
+
+
 def load_workspace(root: Path) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str, Any]]]]:
     """Load and validate one workspace without writing to it."""
 
-    root = root.resolve()
-    config_path = root / ".workspace-organizer" / "config.json"
+    root = _resolve_workspace_root(root)
+    config_relative = ".workspace-organizer/config.json"
+    config_path = _safe_existing_file(root, config_relative)
     config = load_json(config_path)
-    validate_config(config, _relative_to(root, config_path))
+    validate_config(config, config_relative)
 
     task_paths: List[Tuple[Path, str]] = []
     active_root = root / "20_任务"
     if active_root.exists():
         canonical = sorted(active_root.glob("*/TASK.md"), key=lambda path: path.as_posix())
-        nested = set(active_root.rglob("TASK.md")) - set(canonical)
-        if nested:
-            first = sorted(nested, key=lambda path: path.as_posix())[0]
-            raise _error(_relative_to(root, first), "canonical TASK.md must be one level below 20_任务")
-        task_paths.extend((path, "active") for path in canonical)
+        nested = sorted(
+            set(active_root.rglob("TASK.md")) - set(canonical),
+            key=lambda path: path.as_posix(),
+        )
+        for task_path in nested:
+            relative = _relative_to(root, task_path)
+            if is_excluded_path(relative, config) or _has_nested_git_boundary(
+                root, task_path.parent
+            ):
+                continue
+            _safe_existing_file(root, relative)
+            raise _error(
+                relative, "canonical TASK.md must be one level below 20_任务"
+            )
+        for task_path in canonical:
+            relative = _relative_to(root, task_path)
+            if not is_excluded_path(relative, config):
+                task_paths.append((task_path, "active"))
 
     for relative in config["adopted_task_paths"]:
         bundle = root.joinpath(*PurePosixPath(relative).parts)
         task_path = bundle / "TASK.md"
-        if not task_path.is_file():
-            raise _error(relative, "registered adopted task has no TASK.md")
+        task_relative = _relative_to(root, task_path)
+        if is_excluded_path(task_relative, config):
+            raise _error(relative, "registered adopted task is excluded")
         task_paths.append((task_path, "adopted"))
 
     archive_root = root / "90_归档"
@@ -381,14 +523,21 @@ def load_workspace(root: Path) -> Tuple[Dict[str, Any], List[Tuple[str, Dict[str
         archived = sorted(
             archive_root.glob("*/*/*/TASK.md"), key=lambda path: path.as_posix()
         )
-        task_paths.extend((path, "archived") for path in archived)
+        for task_path in archived:
+            relative = _relative_to(root, task_path)
+            if not is_excluded_path(relative, config):
+                task_paths.append((task_path, "archived"))
 
     records: List[Tuple[str, Dict[str, Any]]] = []
     seen_ids: Dict[str, str] = {}
     seen_paths: List[str] = []
     for task_path, location in task_paths:
         relative = _relative_to(root, task_path)
-        validate_relative_path(relative, relative)
+        task_path = _safe_existing_file(root, relative)
+        if _has_nested_git_boundary(root, task_path.parent):
+            if location == "adopted":
+                raise _error(relative, "registered adopted task crosses a nested Git boundary")
+            continue
         data = parse_task(task_path)
         validate_task(data, relative)
         task_id = data["id"]
@@ -653,16 +802,57 @@ def validate_generated_view(view: Mapping[str, Any], context: str = "generated v
 
 
 def validate_schema_documents(repo_root: Path) -> None:
+    schemas: Dict[str, Dict[str, Any]] = {}
     for relative in (
         "schemas/task.schema.json",
         "schemas/workspace-config.schema.json",
         "schemas/generated-view.schema.json",
     ):
         schema = load_json(repo_root / relative)
+        schemas[relative] = schema
         if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
             raise _error(relative, "must declare JSON Schema draft 2020-12")
         if not isinstance(schema.get("$id"), str):
             raise _error(relative, "must declare a stable $id")
+
+    config_pattern = schemas["schemas/workspace-config.schema.json"]["$defs"][
+        "relativePath"
+    ]["pattern"]
+    view_pattern = schemas["schemas/generated-view.schema.json"]["$defs"][
+        "relativePath"
+    ]["pattern"]
+    if config_pattern != view_pattern:
+        raise _error("relativePath schemas", "configuration and view patterns differ")
+    try:
+        compiled = re.compile(config_pattern)
+    except re.error as exc:
+        raise _error("relativePath schemas", f"invalid regular expression: {exc}") from exc
+
+    probes = {
+        "valid/path": True,
+        "Unicode 路径/资料.md": True,
+        "": False,
+        "/absolute": False,
+        "trailing/": False,
+        "empty//segment": False,
+        "dot/./segment": False,
+        "parent/../segment": False,
+        "backslash\\segment": False,
+        "nul\x00segment": False,
+    }
+    for value, expected in probes.items():
+        schema_accepts = compiled.fullmatch(value) is not None
+        try:
+            validate_relative_path(value, "schema probe")
+            validator_accepts = True
+        except ContractError:
+            validator_accepts = False
+        if schema_accepts != expected or validator_accepts != expected:
+            raise _error(
+                "relativePath schemas",
+                f"pattern/validator disagree for {value!r}: "
+                f"schema={schema_accepts} validator={validator_accepts}",
+            )
 
 
 def _build_parser() -> argparse.ArgumentParser:
