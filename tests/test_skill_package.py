@@ -131,6 +131,11 @@ class SkillPackageTests(unittest.TestCase):
             "public < internal < confidential < restricted",
             "90_归档/<closed-year>/<area>/<task-id>/",
             "leave the previous set unchanged",
+            "compressed originals",
+            "do not open,",
+            "path-traversal checks",
+            "resource limits",
+            "scratch space under `/tmp`",
         ):
             self.assertIn(token, package_text)
 

@@ -71,3 +71,13 @@ Apply these gates in order:
 
 Never overwrite, reinterpret, rename, move, delete, publish, or hash-upload
 existing content as a side effect of initialization or adoption.
+
+## Handle compressed originals safely
+
+Treat compressed originals in `10_收件箱/` or `99_待整理/` as `restricted` and
+unmanaged. During a read-only inventory, record only safe metadata; do not open,
+extract, or execute archive contents. If a user later requests listing or
+extraction, delegate only to the deterministic tooling from #4. That tooling
+must require explicit approval and enforce a sandbox, path-traversal checks, and
+resource limits, using temporary scratch space under `/tmp`. Never move or delete
+the original as a side effect.
