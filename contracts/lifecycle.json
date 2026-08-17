@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "initial_statuses": [
+    "planned",
+    "active"
+  ],
+  "open_statuses": [
+    "planned",
+    "active",
+    "waiting",
+    "blocked"
+  ],
+  "closed_statuses": [
+    "completed",
+    "cancelled"
+  ],
+  "terminal_statuses": [
+    "archived"
+  ],
+  "transitions": {
+    "planned": [
+      "active",
+      "cancelled"
+    ],
+    "active": [
+      "waiting",
+      "blocked",
+      "completed",
+      "cancelled"
+    ],
+    "waiting": [
+      "active",
+      "blocked",
+      "completed",
+      "cancelled"
+    ],
+    "blocked": [
+      "active",
+      "waiting",
+      "completed",
+      "cancelled"
+    ],
+    "completed": [
+      "active",
+      "archived"
+    ],
+    "cancelled": [
+      "planned",
+      "active",
+      "archived"
+    ],
+    "archived": []
+  },
+  "archive_eligible_from": [
+    "completed",
+    "cancelled"
+  ],
+  "archive_destination": "90_归档/{closed_year}/{area}/{id}"
+}
