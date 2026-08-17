@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import struct
 import sys
 import tarfile
 import tempfile
@@ -72,6 +74,19 @@ GENERATED_PATHS = {
     "materials": (".workspace-organizer/catalog/materials.json", "00_总览/MATERIALS.md"),
 }
 DEFAULT_SCAN_HASH_LIMIT = 8 * 1024 * 1024
+DEFAULT_COMPRESSED_SOURCE_LIMIT = 256 * 1024 * 1024
+DEFAULT_COMPRESSED_METADATA_LIMIT = 16 * 1024 * 1024
+INITIALIZATION_DIRECTORIES = MANAGED_DIRECTORIES + (".workspace-organizer/verification",)
+ADOPTION_FORBIDDEN_ROOTS = MANAGED_DIRECTORIES
+MATERIAL_INDEX_FORBIDDEN_ROOTS = ("00_总览", "10_收件箱", "90_归档", "99_待整理", ".workspace-organizer")
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+_WRITE_NEW_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
 
 class WorkspaceError(ValueError):
@@ -285,6 +300,15 @@ def serialize_task(data: Mapping[str, Any], body: str) -> bytes:
     return (prefix + body.lstrip("\r\n")).encode("utf-8")
 
 
+def _serialize_task_preserving_body(data: Mapping[str, Any], body: str) -> bytes:
+    sentinel = "workspace-organizer-body-sentinel"
+    rendered = serialize_task(data, sentinel).decode("utf-8")
+    prefix, marker, _ = rendered.partition(sentinel)
+    if not marker:
+        raise _error("TASK.md", "cannot serialize front matter")
+    return prefix.encode("utf-8") + body.encode("utf-8")
+
+
 def validate_config(data: Mapping[str, Any], context: str = "config.json") -> None:
     missing = CONFIG_REQUIRED - set(data)
     unknown = set(data) - CONFIG_REQUIRED
@@ -322,6 +346,13 @@ def validate_config(data: Mapping[str, Any], context: str = "config.json") -> No
         for material in materials:
             if _paths_overlap(task, material):
                 raise _error(context, f"task/material overlap: {task!r} and {material!r}")
+    for registered in tasks + materials:
+        for managed in ADOPTION_FORBIDDEN_ROOTS:
+            if _paths_overlap(managed, registered):
+                raise _error(
+                    context,
+                    f"adopted roots must not overlap managed role {managed!r}: {registered!r}",
+                )
     for registered in tasks + materials:
         for excluded in exclusions:
             if _path_contains(excluded, registered):
@@ -671,17 +702,17 @@ def _validate_plan_shape(plan: Mapping[str, Any]) -> None:
         validate_config(plan["config"], "plan.config")
         if plan["config"]["workspace_id"] != plan["workspace_id"]:
             raise _error("initialize plan", "workspace identity mismatch")
-        if not isinstance(plan["operations"], list) or len(plan["operations"]) != len(MANAGED_DIRECTORIES):
+        if not isinstance(plan["operations"], list) or len(plan["operations"]) != len(INITIALIZATION_DIRECTORIES):
             raise _error("initialize plan", "must cover each managed directory exactly once")
         paths: List[str] = []
         for index, item in enumerate(plan["operations"]):
             if not isinstance(item, dict):
                 raise _error("initialize plan", "operations must be objects")
             _require_keys(item, {"action", "path"}, f"plan.operations[{index}]")
-            if item["action"] not in {"create_directory", "accept_existing_directory"} or item["path"] not in MANAGED_DIRECTORIES:
+            if item["action"] not in {"create_directory", "accept_existing_directory"} or item["path"] not in INITIALIZATION_DIRECTORIES:
                 raise _error("initialize plan", "invalid managed-directory operation")
             paths.append(item["path"])
-        if set(paths) != set(MANAGED_DIRECTORIES) or len(paths) != len(set(paths)):
+        if set(paths) != set(INITIALIZATION_DIRECTORIES) or len(paths) != len(set(paths)):
             raise _error("initialize plan", "managed-directory operations are incomplete or duplicated")
         return
     if operation == "organize":
@@ -740,15 +771,21 @@ def _validate_plan_shape(plan: Mapping[str, Any]) -> None:
         if _sha256_bytes(content) != digest:
             raise _error("archive plan", f"TASK.md {state} digest mismatch")
         decoded[state] = content
-    before, _ = parse_task_bytes(decoded["before"], "plan TASK.md before")
-    after, _ = parse_task_bytes(decoded["after"], "plan TASK.md after")
+    before, before_body = parse_task_bytes(decoded["before"], "plan TASK.md before")
+    after, after_body = parse_task_bytes(decoded["after"], "plan TASK.md after")
     validate_task(before, "plan TASK.md before")
     validate_task(after, "plan TASK.md after")
     expected_destination = f"90_归档/{before['closed_at'][:4]}/{before['area']}/{before['id']}" if before.get("closed_at") else ""
+    expected_after = dict(before)
+    expected_after.update({
+        "status": "archived",
+        "updated": after.get("archived_at"),
+        "archived_at": after.get("archived_at"),
+    })
     if (
         before["id"] != plan["task_id"] or before["status"] not in CLOSED_STATUSES
-        or after["id"] != before["id"] or after["status"] != "archived"
-        or after["closed_at"] != before["closed_at"] or destination != expected_destination
+        or after != expected_after or before_body.encode("utf-8") != after_body.encode("utf-8")
+        or destination != expected_destination
     ):
         raise _error("archive plan", "TASK.md transition or canonical destination is invalid")
 
@@ -790,9 +827,10 @@ def approve_plan(plan_path: Path, approval_path: Path, *, confirmed: bool) -> Di
     return approval
 
 
-def _load_approval(path: Path, plan: Mapping[str, Any], raw_plan: bytes) -> Dict[str, Any]:
+def _load_approval(path: Path, plan: Mapping[str, Any], raw_plan: bytes) -> Tuple[Dict[str, Any], bytes]:
     try:
-        approval = json.loads(path.read_text(encoding="utf-8"))
+        raw_approval = path.read_bytes()
+        approval = json.loads(raw_approval.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _error(str(path), f"cannot read approval: {exc}") from exc
     expected = {
@@ -801,7 +839,7 @@ def _load_approval(path: Path, plan: Mapping[str, Any], raw_plan: bytes) -> Dict
     }
     if approval != expected:
         raise _error(str(path), "approval does not bind the exact plan bytes")
-    return approval
+    return approval, raw_approval
 
 
 def build_initialization_plan(
@@ -845,6 +883,14 @@ def build_initialization_plan(
             operations.append({"action": "accept_existing_directory", "path": relative})
         else:
             operations.append({"action": "create_directory", "path": relative})
+    verification_relative = ".workspace-organizer/verification"
+    verification_path = root / ".workspace-organizer" / "verification"
+    if verification_path.exists() or verification_path.is_symlink():
+        if verification_path.is_symlink() or not verification_path.is_dir():
+            raise _error(verification_relative, "control-plane collision is not a real directory")
+        operations.append({"action": "accept_existing_directory", "path": verification_relative})
+    else:
+        operations.append({"action": "create_directory", "path": verification_relative})
     for relative in config["adopted_task_paths"]:
         task_path = _safe_existing(root, f"{relative}/TASK.md", config=config, kind="file")
         task, _ = parse_task_bytes(task_path.read_bytes(), f"{relative}/TASK.md")
@@ -1021,15 +1067,37 @@ def _pending_or_unassigned(root: Path, task: Mapping[str, Any], config: Mapping[
 
 
 def _has_unverified_reference(root: Path, bundle: str) -> bool:
-    verification = root / ".workspace-organizer" / "verification"
-    if not verification.exists():
+    control = root / ".workspace-organizer"
+    if not control.exists():
         return False
-    for path in sorted(verification.glob("*.json")):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise _error(_relative(root, path), f"cannot validate verification record: {exc}") from exc
-        if record.get("status") == "verified":
+    if control.is_symlink() or not control.is_dir():
+        raise _error(".workspace-organizer", "control plane must be a real directory")
+    directories = [control]
+    verification = control / "verification"
+    if verification.is_symlink():
+        raise _error(".workspace-organizer/verification", "verification directory must not be a symlink")
+    if verification.is_dir():
+        directories.insert(0, verification)
+    records: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for directory in directories:
+        for path in sorted(directory.glob("*.json")):
+            name = path.name
+            match = re.fullmatch(r"([0-9a-f]{64})\.(intent|result)\.json", name)
+            legacy = re.fullmatch(r"([0-9a-f]{64})\.json", name)
+            if match is None and legacy is None:
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise _error(_relative(root, path), "durable record must be a no-follow regular file")
+            record = _load_json_record(path, "durable operation record")
+            plan_id = (match or legacy).group(1)
+            kind = match.group(2) if match is not None else "legacy"
+            records.setdefault(plan_id, {})[kind] = record
+    for group in records.values():
+        result = group.get("result") or group.get("legacy")
+        if result is not None and result.get("status") == "verified":
+            continue
+        record = result or group.get("intent")
+        if record is None:
             continue
         referenced = record.get("referenced_paths", [])
         if any(isinstance(value, str) and _paths_overlap(bundle, value) for value in referenced):
@@ -1063,7 +1131,7 @@ def build_archive_plan(root: Path, task_id: str, archived_at: str) -> Dict[str, 
     before_bytes = (source_path / "TASK.md").read_bytes()
     after_data = dict(data)
     after_data.update({"status": "archived", "archived_at": archived_at, "updated": archived_at})
-    after_bytes = serialize_task(after_data, task["body"])
+    after_bytes = _serialize_task_preserving_body(after_data, task["body"])
     parsed_after, _ = parse_task_bytes(after_bytes, "archived TASK.md")
     validate_task(parsed_after, "archived TASK.md")
     return _plan_with_id({
@@ -1115,7 +1183,77 @@ def _control_subdirectory(root: Path, name: str, *, create: bool) -> Path:
     return target
 
 
-def _load_existing_verification(root: Path, plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+def _load_json_record(path: Path, context: str) -> Dict[str, Any]:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _error(str(path), f"cannot read {context}: {exc}") from exc
+    if not isinstance(record, dict):
+        raise _error(str(path), f"{context} must be a JSON object")
+    return record
+
+
+def _journal_paths(
+    root: Path,
+    plan: Mapping[str, Any],
+    *,
+    plan_path: Optional[Path] = None,
+) -> List[Path]:
+    if plan["operation"] == "initialize":
+        return [plan_path.parent.resolve(strict=True)] if plan_path is not None else []
+    control = root / ".workspace-organizer"
+    if control.is_symlink():
+        raise _error(".workspace-organizer", "control plane must not be a symlink")
+    if not control.is_dir():
+        return []
+    paths: List[Path] = []
+    verification = control / "verification"
+    if verification.is_symlink():
+        raise _error(".workspace-organizer/verification", "verification directory must not be a symlink")
+    if verification.is_dir():
+        paths.append(verification)
+    paths.append(control)
+    return paths
+
+
+def _load_existing_verification(
+    root: Path,
+    plan: Mapping[str, Any],
+    *,
+    plan_path: Optional[Path] = None,
+    raw_plan: Optional[bytes] = None,
+) -> Optional[Dict[str, Any]]:
+    expected_plan_sha = _sha256_bytes(raw_plan) if raw_plan is not None else None
+    for directory in _journal_paths(root, plan, plan_path=plan_path):
+        result_path = directory / f"{plan['plan_id']}.result.json"
+        intent_path = directory / f"{plan['plan_id']}.intent.json"
+        if result_path.exists() or result_path.is_symlink():
+            if result_path.is_symlink() or not result_path.is_file():
+                raise _error(str(result_path), "result record must be a no-follow regular file")
+            record = _load_json_record(result_path, "result record")
+            if record.get("plan_id") != plan["plan_id"]:
+                raise _error(str(result_path), "result identity mismatch")
+            if expected_plan_sha is not None and record.get("plan_sha256") != expected_plan_sha:
+                raise _error(str(result_path), "result does not bind the exact plan bytes")
+            return record
+        if intent_path.exists() or intent_path.is_symlink():
+            if intent_path.is_symlink() or not intent_path.is_file():
+                raise _error(str(intent_path), "intent record must be a no-follow regular file")
+            intent = _load_json_record(intent_path, "intent record")
+            if intent.get("plan_id") != plan["plan_id"]:
+                raise _error(str(intent_path), "intent identity mismatch")
+            if expected_plan_sha is not None and intent.get("plan_sha256") != expected_plan_sha:
+                raise _error(str(intent_path), "intent does not bind the exact plan bytes")
+            return {
+                "schema_version": 1,
+                "record_type": "unfinished-intent",
+                "plan_id": plan["plan_id"],
+                "plan_sha256": intent.get("plan_sha256"),
+                "operation": plan["operation"],
+                "status": "partial",
+                "referenced_paths": intent.get("referenced_paths", []),
+                "intent": intent,
+            }
     control = root / ".workspace-organizer"
     if control.is_symlink():
         raise _error(".workspace-organizer", "control plane must not be a symlink")
@@ -1124,10 +1262,7 @@ def _load_existing_verification(root: Path, plan: Mapping[str, Any]) -> Optional
     path = _verification_path(root, plan["plan_id"])
     if not path.exists():
         return None
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise _error(str(path), f"cannot read verification: {exc}") from exc
+    record = _load_json_record(path, "legacy verification")
     if record.get("plan_id") != plan["plan_id"]:
         raise _error(str(path), "verification identity mismatch")
     return record
@@ -1170,14 +1305,22 @@ def _verify_completed(root: Path, plan: Mapping[str, Any], record: Mapping[str, 
         raise _error("verification", "archived bundle content changed")
 
 
-def validate_plan_preconditions(root: Path, plan: Mapping[str, Any]) -> Dict[str, Any]:
+def validate_plan_preconditions(
+    root: Path,
+    plan: Mapping[str, Any],
+    *,
+    plan_path: Optional[Path] = None,
+    raw_plan: Optional[bytes] = None,
+) -> Dict[str, Any]:
     root = _workspace_root(root)
-    existing = _load_existing_verification(root, plan)
+    existing = _load_existing_verification(
+        root, plan, plan_path=plan_path, raw_plan=raw_plan
+    )
     if existing is not None:
         if existing.get("status") == "verified":
             _verify_completed(root, plan, existing)
             return {"status": "already_applied", "verification": existing}
-        raise _error("apply", "a failed or partial verification record already exists")
+        raise _error("apply", "an unfinished or failed durable operation record already exists")
     if plan["operation"] == "initialize":
         if (root / ".workspace-organizer" / "config.json").exists():
             raise _error("initialize", "workspace was initialized after plan generation")
@@ -1236,12 +1379,25 @@ def dry_run(root: Path, plan_path: Path) -> Dict[str, Any]:
         intended = plan["operations"]
         excluded = load_config(_workspace_root(root))["exclude_paths"]
     else:
-        intended = [{"action": "archive_bundle", "source": plan["source"], "destination": plan["destination"]}]
+        after_bytes = base64.b64decode(plan["task_record_after_base64"], validate=True)
+        after_task, _ = parse_task_bytes(after_bytes, "plan TASK.md after")
+        intended = [
+            {
+                "action": "update_task_record",
+                "path": f"{plan['destination']}/TASK.md",
+                "changes": {
+                    "status": after_task["status"],
+                    "updated": after_task["updated"],
+                    "archived_at": after_task["archived_at"],
+                },
+            },
+            {"action": "archive_bundle", "source": plan["source"], "destination": plan["destination"]},
+        ]
         excluded = load_config(_workspace_root(root))["exclude_paths"]
     errors: List[str] = []
     collisions: List[str] = []
     try:
-        result = validate_plan_preconditions(root, plan)
+        result = validate_plan_preconditions(root, plan, plan_path=plan_path, raw_plan=raw)
         if result["status"] == "already_applied" and result["verification"].get("plan_sha256") != _sha256_bytes(raw):
             raise _error("dry-run", "existing verification binds different plan bytes")
         status = result["status"]
@@ -1264,71 +1420,391 @@ def dry_run(root: Path, plan_path: Path) -> Dict[str, Any]:
     }
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def _read_all(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: List[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def _snapshot_file_descriptor(descriptor: int, context: str) -> Dict[str, Any]:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode):
+        raise _error(context, "must remain a regular file")
+    return {"kind": "file", "bytes": info.st_size, "sha256": _sha256_bytes(_read_all(descriptor))}
+
+
+def _normalized_entry_at(directory_fd: int, name: str, context: str) -> Optional[str]:
+    matches = [entry for entry in os.listdir(directory_fd) if _nfc(entry).casefold() == _nfc(name).casefold()]
+    if len(matches) > 1 or (matches and matches[0] != name):
+        raise _error(context, f"normalized collision for component {name!r}")
+    return matches[0] if matches else None
+
+
+def _open_child_directory_at(directory_fd: int, name: str, context: str, *, create: bool = False) -> int:
+    existing = _normalized_entry_at(directory_fd, name, context)
+    if existing is None:
+        if not create:
+            raise _error(context, f"missing directory component {name!r}")
+        os.mkdir(name, mode=0o700, dir_fd=directory_fd)
+        os.fsync(directory_fd)
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _copy_file_no_overwrite(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with source.open("rb") as input_stream, destination.open("xb") as output_stream:
-        shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
-        output_stream.flush()
-        os.fsync(output_stream.fileno())
-    shutil.copystat(source, destination, follow_symlinks=False)
-    _fsync_directory(destination.parent)
-
-
-def _move_file_verified(source: Path, destination: Path, expected: Mapping[str, Any]) -> Dict[str, Any]:
-    source_identity = source.lstat()
-    if not stat.S_ISREG(source_identity.st_mode):
-        raise _error(str(source), "source identity changed before copy")
-    _copy_file_no_overwrite(source, destination)
-    destination_snapshot = _snapshot_file(destination)
-    if not _same_snapshot(destination_snapshot, expected):
-        raise _error(str(destination), "destination verification failed; source retained")
-    current_identity = source.lstat()
-    if (
-        (current_identity.st_dev, current_identity.st_ino) != (source_identity.st_dev, source_identity.st_ino)
-        or not _same_snapshot(_snapshot_file(source), expected)
-    ):
-        raise _error(str(source), "source identity or content changed before removal; destination retained")
-    try:
-        source.unlink()
-        _fsync_directory(source.parent)
+        child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
     except OSError as exc:
-        raise _error(str(source), f"verified destination exists but source could not be removed: {exc}") from exc
-    if source.exists() or source.is_symlink() or not _same_snapshot(_snapshot_file(destination), expected):
-        raise _error(str(destination), "post-move verification failed")
-    return {"source": None, "destination": destination_snapshot, "verified": True}
+        raise _error(context, f"directory component {name!r} is not a no-follow directory: {exc}") from exc
+    try:
+        os.stat(".git", dir_fd=child_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return child_fd
+    except OSError as exc:
+        os.close(child_fd)
+        raise _error(context, f"cannot inspect nested Git boundary: {exc}") from exc
+    os.close(child_fd)
+    raise _error(context, "path crosses a nested Git repository")
 
 
-def _copy_tree_no_links(source: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=False)
-    for current, directories, files in os.walk(source, topdown=True, followlinks=False):
-        current_path = Path(current)
-        directories.sort(key=lambda value: (_nfc(value).casefold(), _nfc(value)))
-        files.sort(key=lambda value: (_nfc(value).casefold(), _nfc(value)))
-        relative = current_path.relative_to(source)
-        target = destination / relative
-        for name in directories:
-            child = current_path / name
-            if child.is_symlink():
-                raise _error(str(child), "archive source contains a symlink")
-            (target / name).mkdir(exist_ok=False)
-        for name in files:
-            child = current_path / name
-            if child.is_symlink() or not child.is_file():
-                raise _error(str(child), "archive source contains a symlink or non-regular file")
-            _copy_file_no_overwrite(child, target / name)
+def _check_apply_path(relative: str, config: Optional[Mapping[str, Any]], *, internal_control: bool = False) -> str:
+    relative = validate_relative_path(relative, relative)
+    if any(part.casefold() == ".git" for part in relative.split("/")):
+        raise _error(relative, "VCS paths are excluded")
+    if not internal_control and _path_contains(".workspace-organizer", relative):
+        raise _error(relative, "control-plane paths are not user operations")
+    if _path_contains(".workspace-organizer/cache", relative) or _is_config_excluded(relative, config):
+        raise _error(relative, "path is excluded")
+    return relative
 
 
-def _write_verification(root: Path, record: Mapping[str, Any]) -> None:
-    path = _control_subdirectory(root, "verification", create=True) / f"{record['plan_id']}.json"
-    write_immutable_json(path, record)
+def _open_parent_descriptor(
+    root: Path,
+    relative: str,
+    *,
+    config: Optional[Mapping[str, Any]],
+    create: bool,
+    internal_control: bool = False,
+) -> Tuple[int, str]:
+    relative = _check_apply_path(relative, config, internal_control=internal_control)
+    root_fd = os.open(root, _DIRECTORY_FLAGS)
+    current = root_fd
+    try:
+        parts = PurePosixPath(relative).parts
+        for part in parts[:-1]:
+            next_fd = _open_child_directory_at(current, part, relative, create=create)
+            os.close(current)
+            current = next_fd
+        return current, parts[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _open_directory_descriptor(
+    root: Path,
+    relative: str,
+    config: Optional[Mapping[str, Any]],
+    *,
+    internal_control: bool = False,
+) -> Tuple[int, int, str]:
+    parent_fd, name = _open_parent_descriptor(
+        root, relative, config=config, create=False, internal_control=internal_control
+    )
+    try:
+        directory_fd = _open_child_directory_at(parent_fd, name, relative, create=False)
+        return parent_fd, directory_fd, name
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _open_file_descriptor(
+    root: Path,
+    relative: str,
+    config: Optional[Mapping[str, Any]],
+    *,
+    internal_control: bool = False,
+) -> Tuple[int, int, str, os.stat_result]:
+    parent_fd, name = _open_parent_descriptor(
+        root, relative, config=config, create=False, internal_control=internal_control
+    )
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise _error(relative, "must be a no-follow regular file")
+        return parent_fd, descriptor, name, info
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _open_relative_parent_from(directory_fd: int, relative: str, *, create: bool) -> Tuple[int, str]:
+    relative = validate_relative_path(relative, relative)
+    current = os.dup(directory_fd)
+    try:
+        parts = PurePosixPath(relative).parts
+        for part in parts[:-1]:
+            next_fd = _open_child_directory_at(current, part, relative, create=create)
+            os.close(current)
+            current = next_fd
+        return current, parts[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _snapshot_tree_descriptor(directory_fd: int, context: str) -> Dict[str, Any]:
+    files: List[Dict[str, Any]] = []
+    directories: List[str] = [""]
+
+    def walk(current_fd: int, prefix: str) -> None:
+        names = sorted(os.listdir(current_fd), key=lambda value: (_nfc(value).casefold(), _nfc(value)))
+        seen: Dict[str, str] = {}
+        for name in names:
+            key = _nfc(name).casefold()
+            if key in seen:
+                raise _error(context, f"normalized collision between {seen[key]!r} and {name!r}")
+            seen[key] = name
+            if name.casefold() == ".git":
+                raise _error(context, "bundle contains a nested Git repository")
+            local = f"{prefix}/{name}" if prefix else name
+            info = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                raise _error(context, f"bundle entry {local!r} is a symlink or non-regular object")
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=current_fd)
+                try:
+                    directories.append(local)
+                    walk(child_fd, local)
+                finally:
+                    os.close(child_fd)
+            else:
+                file_fd = os.open(name, _READ_FLAGS, dir_fd=current_fd)
+                try:
+                    files.append({"path": local, **_snapshot_file_descriptor(file_fd, local)})
+                finally:
+                    os.close(file_fd)
+
+    walk(directory_fd, "")
+    files.sort(key=lambda item: _collision_key(item["path"]))
+    directories.sort(key=lambda value: _collision_key(value) if value else ())
+    digest = _sha256_bytes(_canonical_json({"directories": directories, "files": files}))
+    return {"kind": "directory", "tree_sha256": digest, "directories": directories, "files": files}
+
+
+def _copy_fd_data(source_fd: int, destination_fd: int) -> None:
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(source_fd, 1024 * 1024)
+        if not chunk:
+            break
+        _write_all(destination_fd, chunk)
+    os.lseek(source_fd, 0, os.SEEK_SET)
+
+
+def _remove_entry_tree_at(parent_fd: int, name: str) -> None:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    directory_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        for child in os.listdir(directory_fd):
+            _remove_entry_tree_at(directory_fd, child)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _stage_file_at(source_fd: int, destination_parent_fd: int, temporary_name: str, expected: Mapping[str, Any]) -> Dict[str, Any]:
+    descriptor: Optional[int] = None
+    created = False
+    try:
+        descriptor = os.open(temporary_name, _WRITE_NEW_FLAGS, 0o600, dir_fd=destination_parent_fd)
+        created = True
+        _copy_fd_data(source_fd, descriptor)
+        os.fsync(descriptor)
+        snapshot = _snapshot_file_descriptor(descriptor, temporary_name)
+        if not _same_snapshot(snapshot, expected):
+            raise _error(temporary_name, "temporary copy does not match approved source")
+        os.close(descriptor)
+        descriptor = None
+        os.fsync(destination_parent_fd)
+        return snapshot
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(temporary_name, dir_fd=destination_parent_fd)
+                os.fsync(destination_parent_fd)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _install_file_noreplace_at(parent_fd: int, temporary_name: str, final_name: str) -> None:
+    if _normalized_entry_at(parent_fd, final_name, final_name) is not None:
+        raise _error(final_name, "destination already exists")
+    os.link(
+        temporary_name,
+        final_name,
+        src_dir_fd=parent_fd,
+        dst_dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    os.fsync(parent_fd)
+    os.unlink(temporary_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _rename_noreplace_at(parent_fd: int, temporary_name: str, final_name: str) -> None:
+    if _normalized_entry_at(parent_fd, final_name, final_name) is not None:
+        raise _error(final_name, "destination already exists")
+    library = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(temporary_name)
+    destination = os.fsencode(final_name)
+    result = -1
+    if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
+        function = library.renameatx_np
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(parent_fd, source, parent_fd, destination, 0x00000004 | 0x00000010)
+    elif hasattr(library, "renameat2"):
+        function = library.renameat2
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(parent_fd, source, parent_fd, destination, 0x00000001)
+    else:
+        raise _error(final_name, "this POSIX platform lacks atomic no-replace directory installation")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), final_name)
+    os.fsync(parent_fd)
+
+
+def _write_bytes_new_at(parent_fd: int, name: str, payload: bytes, mode: int = 0o600) -> Dict[str, Any]:
+    descriptor: Optional[int] = None
+    created = False
+    try:
+        descriptor = os.open(name, _WRITE_NEW_FLAGS, mode, dir_fd=parent_fd)
+        created = True
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        snapshot = _snapshot_file_descriptor(descriptor, name)
+        os.close(descriptor)
+        descriptor = None
+        os.fsync(parent_fd)
+        return snapshot
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+class _Journal:
+    def __init__(self, directory_fd: int, display_directory: Path, plan_id: str, plan_sha256: str):
+        self.directory_fd = directory_fd
+        self.display_directory = display_directory
+        self.plan_id = plan_id
+        self.plan_sha256 = plan_sha256
+        self.events: List[str] = []
+
+    def close(self) -> None:
+        os.close(self.directory_fd)
+
+    def name(self, suffix: str) -> str:
+        return f"{self.plan_id}.{suffix}.json"
+
+    def read(self, suffix: str) -> Optional[Dict[str, Any]]:
+        name = self.name(suffix)
+        try:
+            descriptor = os.open(name, _READ_FLAGS, dir_fd=self.directory_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            value = json.loads(_read_all(descriptor).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise _error(str(self.display_directory / name), f"invalid durable journal record: {exc}") from exc
+        finally:
+            os.close(descriptor)
+        if not isinstance(value, dict) or value.get("plan_id") != self.plan_id or value.get("plan_sha256") != self.plan_sha256:
+            raise _error(str(self.display_directory / name), "journal identity mismatch")
+        return value
+
+    def write(self, suffix: str, record: Mapping[str, Any]) -> str:
+        name = self.name(suffix)
+        _write_bytes_new_at(self.directory_fd, name, _pretty_json(record))
+        self.events.append(name)
+        return name
+
+
+def _open_journal(root: Path, plan_path: Path, plan: Mapping[str, Any], raw_plan: bytes) -> _Journal:
+    if plan["operation"] == "initialize":
+        directory = plan_path.parent.resolve(strict=True)
+        directory_fd = os.open(directory, _DIRECTORY_FLAGS)
+        return _Journal(directory_fd, directory, plan["plan_id"], _sha256_bytes(raw_plan))
+    root_fd = os.open(root, _DIRECTORY_FLAGS)
+    try:
+        control_fd = _open_child_directory_at(root_fd, ".workspace-organizer", ".workspace-organizer", create=False)
+    finally:
+        os.close(root_fd)
+    display = root / ".workspace-organizer"
+    try:
+        existing = _normalized_entry_at(control_fd, "verification", ".workspace-organizer/verification")
+        if existing is not None:
+            verification_fd = _open_child_directory_at(control_fd, "verification", ".workspace-organizer/verification", create=False)
+            os.close(control_fd)
+            control_fd = verification_fd
+            display = display / "verification"
+        return _Journal(control_fd, display, plan["plan_id"], _sha256_bytes(raw_plan))
+    except BaseException:
+        os.close(control_fd)
+        raise
+
+
+def _write_intent(journal: _Journal, record: Mapping[str, Any]) -> None:
+    journal.write("intent", record)
+
+
+def _write_wal_stage(journal: _Journal, sequence: int, stage: str, evidence: Mapping[str, Any]) -> None:
+    journal.write(
+        f"wal-{sequence:03d}-{stage}",
+        {
+            "schema_version": 1,
+            "record_type": "wal-stage",
+            "plan_id": journal.plan_id,
+            "plan_sha256": journal.plan_sha256,
+            "sequence": sequence,
+            "stage": stage,
+            "evidence": dict(evidence),
+        },
+    )
+
+
+def _write_result(journal: _Journal, record: Mapping[str, Any]) -> None:
+    journal.write("result", record)
 
 
 def _referenced_paths(plan: Mapping[str, Any]) -> List[str]:
@@ -1339,164 +1815,757 @@ def _referenced_paths(plan: Mapping[str, Any]) -> List[str]:
     return [plan["source"], plan["destination"]]
 
 
-def _apply_initialize(root: Path, plan: Mapping[str, Any], results: List[Dict[str, Any]]) -> None:
-    for operation in plan["operations"]:
-        target = root / operation["path"]
-        if operation["action"] == "create_directory":
-            target.mkdir(exist_ok=False)
-            results.append({**operation, "verified": target.is_dir() and not target.is_symlink()})
+class _WalCursor:
+    def __init__(self, journal: _Journal):
+        self.journal = journal
+        self.sequence = 0
+
+    def write(self, stage: str, evidence: Mapping[str, Any]) -> None:
+        self.sequence += 1
+        _write_wal_stage(self.journal, self.sequence, stage, evidence)
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino, stat.S_IFMT(left.st_mode)) == (
+        right.st_dev, right.st_ino, stat.S_IFMT(right.st_mode)
+    )
+
+
+def _cleanup_temporary_at(parent_fd: int, name: str) -> None:
+    try:
+        _remove_entry_tree_at(parent_fd, name)
+        os.fsync(parent_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _open_parent_descriptor_journaled(
+    root: Path,
+    relative: str,
+    *,
+    config: Optional[Mapping[str, Any]],
+    wal: _WalCursor,
+) -> Tuple[int, str]:
+    relative = _check_apply_path(relative, config)
+    current = os.open(root, _DIRECTORY_FLAGS)
+    try:
+        parts = PurePosixPath(relative).parts
+        prefix: List[str] = []
+        for part in parts[:-1]:
+            prefix.append(part)
+            current_relative = "/".join(prefix)
+            existing = _normalized_entry_at(current, part, current_relative)
+            if existing is None:
+                wal.write("create-destination-parent", {"path": current_relative, "rollback": "remove-if-empty"})
+                os.mkdir(part, mode=0o700, dir_fd=current)
+                os.fsync(current)
+            next_fd = _open_child_directory_at(current, part, current_relative, create=False)
+            os.close(current)
+            current = next_fd
+        return current, parts[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _make_intent(
+    plan: Mapping[str, Any],
+    raw_plan: bytes,
+    approval_sha256: str,
+    config_before: Optional[Mapping[str, Any]],
+    config_after: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    rollback: Dict[str, Any] = {
+        "mode": "manual-verified-recovery",
+        "referenced_paths": _referenced_paths(plan),
+    }
+    if plan["operation"] == "organize":
+        rollback["moves"] = [
+            {
+                "source": item["source"],
+                "destination": item["destination"],
+                "required_sha256": item["source_snapshot"]["sha256"],
+            }
+            for item in plan["operations"]
+        ]
+    elif plan["operation"] == "archive":
+        rollback.update({
+            "restore_path": plan["source"],
+            "archived_path": plan["destination"],
+            "source_snapshot": plan["source_snapshot"],
+            "task_record_before_base64": plan["task_record_before_base64"],
+        })
+    return {
+        "schema_version": 1,
+        "record_type": "immutable-intent",
+        "plan_id": plan["plan_id"],
+        "plan_sha256": _sha256_bytes(raw_plan),
+        "approval_sha256": approval_sha256,
+        "operation": plan["operation"],
+        "workspace_id": plan["workspace_id"],
+        "referenced_paths": _referenced_paths(plan),
+        "plan": dict(plan),
+        "config_before": dict(config_before) if config_before is not None else None,
+        "config_after": dict(config_after) if config_after is not None else None,
+        "rollback": rollback,
+    }
+
+
+def _apply_initialize(
+    root: Path,
+    plan: Mapping[str, Any],
+    results: List[Dict[str, Any]],
+    wal: _WalCursor,
+) -> None:
+    root_fd = os.open(root, _DIRECTORY_FLAGS)
+    try:
+        for operation in plan["operations"]:
+            relative = operation["path"]
+            parts = PurePosixPath(relative).parts
+            if len(parts) == 1:
+                parent_fd = os.dup(root_fd)
+                name = parts[0]
+            else:
+                parent_fd = os.dup(root_fd)
+                try:
+                    for part in parts[:-1]:
+                        next_fd = _open_child_directory_at(parent_fd, part, relative, create=False)
+                        os.close(parent_fd)
+                        parent_fd = next_fd
+                    name = parts[-1]
+                except BaseException:
+                    os.close(parent_fd)
+                    raise
+            try:
+                existing = _normalized_entry_at(parent_fd, name, relative)
+                if operation["action"] == "create_directory":
+                    if existing is not None:
+                        raise _error(relative, "planned directory now exists")
+                    wal.write("create-managed-directory", {"path": relative, "rollback": "remove-if-empty"})
+                    os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                elif existing is None:
+                    raise _error(relative, "accepted managed directory disappeared")
+                check_fd = _open_child_directory_at(parent_fd, name, relative, create=False)
+                os.close(check_fd)
+                results.append({**operation, "verified": True})
+            finally:
+                os.close(parent_fd)
+
+        control_fd = _open_child_directory_at(root_fd, ".workspace-organizer", ".workspace-organizer", create=False)
+        temporary_name = f".config.{plan['plan_id']}.tmp"
+        temporary_created = False
+        config_bytes = _pretty_json(plan["config"])
+        try:
+            wal.write("stage-initial-config", {
+                "path": ".workspace-organizer/config.json",
+                "sha256": _sha256_bytes(config_bytes),
+                "temporary_name": temporary_name,
+            })
+            _write_bytes_new_at(control_fd, temporary_name, config_bytes)
+            temporary_created = True
+            wal.write("install-initial-config", {
+                "path": ".workspace-organizer/config.json",
+                "sha256": _sha256_bytes(config_bytes),
+                "rollback": "remove-only-if-sha256-matches",
+            })
+            _install_file_noreplace_at(control_fd, temporary_name, "config.json")
+            temporary_created = False
+        except BaseException:
+            if temporary_created:
+                _cleanup_temporary_at(control_fd, temporary_name)
+            raise
+        finally:
+            os.close(control_fd)
+    finally:
+        os.close(root_fd)
+    parent_fd, descriptor, _, _ = _open_file_descriptor(
+        root, ".workspace-organizer/config.json", None, internal_control=True
+    )
+    try:
+        written = _read_all(descriptor)
+        if json.loads(written.decode("utf-8")) != plan["config"]:
+            raise _error("initialize", "written configuration failed verification")
+    finally:
+        os.close(descriptor)
+        os.close(parent_fd)
+    results.append({
+        "action": "write_config",
+        "path": ".workspace-organizer/config.json",
+        "sha256": _sha256_bytes(written),
+        "verified": True,
+    })
+
+
+def _apply_organize(
+    root: Path,
+    plan: Mapping[str, Any],
+    config: Mapping[str, Any],
+    results: List[Dict[str, Any]],
+    wal: _WalCursor,
+) -> None:
+    for index, operation in enumerate(plan["operations"]):
+        source_parent_fd, source_fd, source_name, source_info = _open_file_descriptor(
+            root, operation["source"], config
+        )
+        destination_parent_fd: Optional[int] = None
+        temporary_name = f".workspace-organizer-{plan['plan_id'][:16]}-{index:03d}.tmp"
+        temporary_created = False
+        try:
+            source_snapshot = _snapshot_file_descriptor(source_fd, operation["source"])
+            if not _same_snapshot(source_snapshot, operation["source_snapshot"]):
+                raise _error(operation["source"], "source changed after plan approval")
+            destination_parent_fd, destination_name = _open_parent_descriptor_journaled(
+                root, operation["destination"], config=config, wal=wal
+            )
+            if _normalized_entry_at(destination_parent_fd, destination_name, operation["destination"]) is not None:
+                raise _error(operation["destination"], "destination already exists")
+            wal.write("stage-file-copy", {
+                "source": operation["source"],
+                "destination": operation["destination"],
+                "temporary_name": temporary_name,
+                "source_snapshot": source_snapshot,
+            })
+            temporary_snapshot = _stage_file_at(
+                source_fd, destination_parent_fd, temporary_name, operation["source_snapshot"]
+            )
+            temporary_created = True
+            wal.write("install-file", {
+                "source": operation["source"],
+                "destination": operation["destination"],
+                "temporary_snapshot": temporary_snapshot,
+                "rollback": "retain-source-until-fresh-destination-verification",
+            })
+            _install_file_noreplace_at(destination_parent_fd, temporary_name, destination_name)
+            temporary_created = False
+
+            fresh_parent_fd, fresh_fd, _, fresh_info = _open_file_descriptor(
+                root, operation["destination"], config
+            )
+            try:
+                destination_snapshot = _snapshot_file_descriptor(fresh_fd, operation["destination"])
+                installed_info = os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+                if not _same_identity(installed_info, fresh_info) or not _same_snapshot(
+                    destination_snapshot, operation["source_snapshot"]
+                ):
+                    raise _error(operation["destination"], "fresh destination verification failed")
+            finally:
+                os.close(fresh_fd)
+                os.close(fresh_parent_fd)
+
+            current_source = _snapshot_file_descriptor(source_fd, operation["source"])
+            path_source_info = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+            if not _same_identity(path_source_info, source_info) or not _same_snapshot(
+                current_source, operation["source_snapshot"]
+            ):
+                raise _error(operation["source"], "source identity changed before removal")
+            wal.write("remove-source-file", {
+                "source": operation["source"],
+                "destination": operation["destination"],
+                "source_snapshot": current_source,
+                "rollback": {
+                    "copy_from": operation["destination"],
+                    "restore_to": operation["source"],
+                    "required_sha256": current_source["sha256"],
+                },
+            })
+            delete_parent_fd, delete_destination_fd, _, delete_destination_info = _open_file_descriptor(
+                root, operation["destination"], config
+            )
+            try:
+                if not _same_identity(installed_info, delete_destination_info) or not _same_snapshot(
+                    _snapshot_file_descriptor(delete_destination_fd, operation["destination"]),
+                    operation["source_snapshot"],
+                ):
+                    raise _error(operation["destination"], "destination binding changed before source removal")
+            finally:
+                os.close(delete_destination_fd)
+                os.close(delete_parent_fd)
+            delete_source_info = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+            if not _same_identity(delete_source_info, source_info) or not _same_snapshot(
+                _snapshot_file_descriptor(source_fd, operation["source"]),
+                operation["source_snapshot"],
+            ):
+                raise _error(operation["source"], "source binding changed at removal boundary")
+            os.unlink(source_name, dir_fd=source_parent_fd)
+            os.fsync(source_parent_fd)
+            try:
+                os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise _error(operation["source"], "source removal did not persist")
+            final_parent_fd, final_fd, _, final_info = _open_file_descriptor(
+                root, operation["destination"], config
+            )
+            try:
+                if not _same_identity(installed_info, final_info) or not _same_snapshot(
+                    _snapshot_file_descriptor(final_fd, operation["destination"]),
+                    operation["source_snapshot"],
+                ):
+                    raise _error(operation["destination"], "destination changed after source removal")
+            finally:
+                os.close(final_fd)
+                os.close(final_parent_fd)
+            results.append({
+                **operation,
+                "post_apply": {
+                    "source_absent": True,
+                    "destination_snapshot": destination_snapshot,
+                    "rollback": {
+                        "copy_from": operation["destination"],
+                        "restore_to": operation["source"],
+                        "required_sha256": destination_snapshot["sha256"],
+                    },
+                    "verified": True,
+                },
+            })
+        finally:
+            if destination_parent_fd is not None:
+                if temporary_created:
+                    _cleanup_temporary_at(destination_parent_fd, temporary_name)
+                os.close(destination_parent_fd)
+            os.close(source_fd)
+            os.close(source_parent_fd)
+
+
+def _expected_archive_snapshot(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    files: List[Dict[str, Any]] = []
+    after_bytes = base64.b64decode(plan["task_record_after_base64"], validate=True)
+    for item in plan["source_snapshot"]["files"]:
+        if item["path"] == "TASK.md":
+            files.append({
+                "path": "TASK.md",
+                "kind": "file",
+                "bytes": len(after_bytes),
+                "sha256": plan["task_record_after_sha256"],
+            })
         else:
-            results.append({**operation, "verified": target.is_dir() and not target.is_symlink()})
-    config_path = root / ".workspace-organizer" / "config.json"
-    with config_path.open("xb") as stream:
-        stream.write(_pretty_json(plan["config"]))
-        stream.flush()
-        os.fsync(stream.fileno())
-    loaded = load_config(root)
-    if loaded != plan["config"]:
-        raise _error("initialize", "written configuration failed verification")
-    results.append({"action": "write_config", "path": ".workspace-organizer/config.json", "sha256": _sha256_file(config_path), "verified": True})
+            files.append(dict(item))
+    directories = list(plan["source_snapshot"]["directories"])
+    tree_sha256 = _sha256_bytes(_canonical_json({"directories": directories, "files": files}))
+    return {"kind": "directory", "tree_sha256": tree_sha256, "directories": directories, "files": files}
 
 
-def _apply_organize(root: Path, plan: Mapping[str, Any], config: Mapping[str, Any], results: List[Dict[str, Any]]) -> None:
-    for operation in plan["operations"]:
-        source = _safe_existing(root, operation["source"], config=config, kind="file")
-        destination = _safe_destination(root, operation["destination"], config=config)
-        evidence = _move_file_verified(source, destination, operation["source_snapshot"])
-        results.append({**operation, "post_apply": evidence})
-
-
-def _remove_empty_tree_after_verified_copy(source: Path, expected: Mapping[str, Any]) -> None:
+def _copy_archive_tree_to_temporary(
+    source_fd: int,
+    temporary_fd: int,
+    plan: Mapping[str, Any],
+) -> Dict[str, Any]:
+    expected = _expected_archive_snapshot(plan)
+    directories = [value for value in expected["directories"] if value]
+    directories.sort(key=lambda value: (len(PurePosixPath(value).parts), _collision_key(value)))
+    for relative in directories:
+        parent_fd, name = _open_relative_parent_from(temporary_fd, relative, create=False)
+        try:
+            if _normalized_entry_at(parent_fd, name, relative) is not None:
+                raise _error(relative, "temporary archive directory collision")
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    source_files = {item["path"]: item for item in plan["source_snapshot"]["files"]}
     expected_files = {item["path"]: item for item in expected["files"]}
-    for relative in sorted(expected_files, key=_collision_key):
-        child = source.joinpath(*PurePosixPath(relative).parts)
-        if child.is_symlink() or not child.is_file() or not _same_snapshot(
-            _snapshot_file(child), {key: expected_files[relative][key] for key in ("kind", "bytes", "sha256")}
-        ):
-            raise _error(str(child), "source changed before verified removal")
-        child.unlink()
+    after_bytes = base64.b64decode(plan["task_record_after_base64"], validate=True)
+    for relative in sorted(source_files, key=_collision_key):
+        source_parent_fd, source_name = _open_relative_parent_from(source_fd, relative, create=False)
+        destination_parent_fd, destination_name = _open_relative_parent_from(temporary_fd, relative, create=False)
+        source_file_fd: Optional[int] = None
+        try:
+            source_file_fd = os.open(source_name, _READ_FLAGS, dir_fd=source_parent_fd)
+            if not _same_snapshot(
+                _snapshot_file_descriptor(source_file_fd, relative),
+                {key: source_files[relative][key] for key in ("kind", "bytes", "sha256")},
+            ):
+                raise _error(relative, "archive source file changed during copy")
+            if relative == "TASK.md":
+                _write_bytes_new_at(destination_parent_fd, destination_name, after_bytes)
+            else:
+                _stage_file_at(
+                    source_file_fd,
+                    destination_parent_fd,
+                    destination_name,
+                    {key: expected_files[relative][key] for key in ("kind", "bytes", "sha256")},
+                )
+        finally:
+            if source_file_fd is not None:
+                os.close(source_file_fd)
+            os.close(source_parent_fd)
+            os.close(destination_parent_fd)
+    actual = _snapshot_tree_descriptor(temporary_fd, "temporary archive tree")
+    if not _same_snapshot(actual, expected):
+        raise _error(plan["destination"], "temporary archive tree failed exact verification")
+    return actual
+
+
+def _remove_approved_tree_at(
+    source_parent_fd: int,
+    source_name: str,
+    source_fd: int,
+    expected: Mapping[str, Any],
+) -> None:
+    files = {item["path"]: item for item in expected["files"]}
+    for relative in sorted(files, key=_collision_key):
+        parent_fd, name = _open_relative_parent_from(source_fd, relative, create=False)
+        descriptor: Optional[int] = None
+        try:
+            descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+            descriptor_info = os.fstat(descriptor)
+            path_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_identity(descriptor_info, path_info) or not _same_snapshot(
+                _snapshot_file_descriptor(descriptor, relative),
+                {key: files[relative][key] for key in ("kind", "bytes", "sha256")},
+            ):
+                raise _error(relative, "archive source changed before verified removal")
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_fd)
     directories = [value for value in expected["directories"] if value]
     directories.sort(key=lambda value: (-len(PurePosixPath(value).parts), _collision_key(value)))
     for relative in directories:
-        child = source.joinpath(*PurePosixPath(relative).parts)
-        if child.is_symlink() or not child.is_dir():
-            raise _error(str(child), "source directory changed before verified removal")
-        child.rmdir()
-    source.rmdir()
+        parent_fd, name = _open_relative_parent_from(source_fd, relative, create=False)
+        directory_fd: Optional[int] = None
+        try:
+            directory_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            if not _same_identity(
+                os.fstat(directory_fd), os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            ):
+                raise _error(relative, "archive source directory identity changed")
+            os.rmdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+            os.close(parent_fd)
+    if not _same_identity(
+        os.fstat(source_fd), os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+    ):
+        raise _error(source_name, "archive source root identity changed")
+    os.rmdir(source_name, dir_fd=source_parent_fd)
+    os.fsync(source_parent_fd)
 
 
-def _apply_archive(root: Path, plan: Mapping[str, Any], config: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
-    source = _safe_existing(root, plan["source"], config=config, kind="directory")
-    destination = _safe_destination(root, plan["destination"], config=config)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    _copy_tree_no_links(source, destination)
-    after_bytes = base64.b64decode(plan["task_record_after_base64"], validate=True)
-    task_destination = destination / "TASK.md"
-    current_copy = task_destination.read_bytes()
-    if _sha256_bytes(current_copy) != plan["task_record_before_sha256"]:
-        raise _error(plan["destination"], "copied TASK.md does not match approved source")
-    temporary = task_destination.with_name(".TASK.md.workspace-organizer.tmp")
-    with temporary.open("xb") as stream:
-        stream.write(after_bytes)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, task_destination)
-    if _sha256_file(task_destination) != plan["task_record_after_sha256"]:
-        raise _error(plan["destination"], "archived TASK.md verification failed; source retained")
-    after_config = config
-    if plan["adopted_source"]:
-        after_config = dict(config)
-        after_config["adopted_task_paths"] = [path for path in config["adopted_task_paths"] if path != plan["source"]]
-        validate_config(after_config)
-    destination_snapshot = _snapshot_directory(root, plan["destination"], after_config)
-    expected_files = [item for item in plan["source_snapshot"]["files"] if item["path"] != "TASK.md"]
-    actual_files = [item for item in destination_snapshot["files"] if item["path"] != "TASK.md"]
-    if expected_files != actual_files or plan["source_snapshot"]["directories"] != destination_snapshot["directories"]:
-        raise _error(plan["destination"], "archive destination content verification failed; source retained")
-    if plan["adopted_source"]:
-        config_path = root / ".workspace-organizer" / "config.json"
-        config_tmp = config_path.with_name("config.json.workspace-organizer.tmp")
-        with config_tmp.open("xb") as stream:
-            stream.write(_pretty_json(after_config))
-            stream.flush()
-            os.fsync(stream.fileno())
-        if _sha256_bytes(_canonical_json(load_config(root))) != plan["config_sha256"]:
-            raise _error("archive", "configuration changed before adopted-task update; source retained")
-        os.replace(config_tmp, config_path)
-        if load_config(root) != after_config:
-            raise _error("archive", "adopted-task registration update failed; source retained")
-    if not _same_snapshot(_snapshot_directory(root, plan["source"], after_config), plan["source_snapshot"]):
-        raise _error(plan["source"], "archive source changed before removal; destination retained")
-    _remove_empty_tree_after_verified_copy(source, plan["source_snapshot"])
-    if source.exists() or not destination.is_dir() or _sha256_file(task_destination) != plan["task_record_after_sha256"]:
-        raise _error("archive", "post-archive verification failed")
-    results.append({
-        "action": "archive_bundle",
-        "source": plan["source"],
-        "destination": plan["destination"],
-        "source_snapshot": plan["source_snapshot"],
-        "destination_snapshot": destination_snapshot,
-        "task_record_before_sha256": plan["task_record_before_sha256"],
-        "task_record_after_sha256": plan["task_record_after_sha256"],
-        "rollback": {
-            "restore_path": plan["source"],
-            "archived_path": plan["destination"],
-            "task_record_before_base64": plan["task_record_before_base64"],
-            "required_destination_tree_sha256": destination_snapshot["tree_sha256"],
-            "mode": "verified_exact_archive_rollback_only",
-        },
-        "verified": True,
+def _replace_adopted_config(
+    root: Path,
+    plan: Mapping[str, Any],
+    config_before: Mapping[str, Any],
+    config_after: Mapping[str, Any],
+    wal: _WalCursor,
+) -> None:
+    parent_fd, descriptor, name, original_info = _open_file_descriptor(
+        root, ".workspace-organizer/config.json", None, internal_control=True
+    )
+    temporary_name = f".config.{plan['plan_id']}.tmp"
+    temporary_created = False
+    try:
+        try:
+            loaded = json.loads(_read_all(descriptor).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise _error("archive", f"configuration became unreadable: {exc}") from exc
+        validate_config(loaded)
+        if loaded != config_before or _sha256_bytes(_canonical_json(loaded)) != plan["config_sha256"]:
+            raise _error("archive", "configuration changed before adopted-task update")
+        payload = _pretty_json(config_after)
+        wal.write("stage-adopted-config", {
+            "path": ".workspace-organizer/config.json",
+            "before": config_before,
+            "after": config_after,
+            "temporary_name": temporary_name,
+            "after_sha256": _sha256_bytes(payload),
+        })
+        _write_bytes_new_at(parent_fd, temporary_name, payload)
+        temporary_created = True
+        current_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_identity(current_info, original_info):
+            raise _error("archive", "configuration identity changed before replacement")
+        wal.write("install-adopted-config", {
+            "path": ".workspace-organizer/config.json",
+            "before": config_before,
+            "after": config_after,
+            "rollback": "restore exact config_before before re-registering source",
+        })
+        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary_created = False
+        os.fsync(parent_fd)
+    except BaseException:
+        if temporary_created:
+            _cleanup_temporary_at(parent_fd, temporary_name)
+        raise
+    finally:
+        os.close(descriptor)
+        os.close(parent_fd)
+    fresh_parent_fd, fresh_fd, _, _ = _open_file_descriptor(
+        root, ".workspace-organizer/config.json", None, internal_control=True
+    )
+    try:
+        fresh = json.loads(_read_all(fresh_fd).decode("utf-8"))
+        if fresh != config_after:
+            raise _error("archive", "adopted-task configuration update failed verification")
+    finally:
+        os.close(fresh_fd)
+        os.close(fresh_parent_fd)
+    wal.write("adopted-config-verified", {
+        "path": ".workspace-organizer/config.json",
+        "after": config_after,
     })
+
+
+def _apply_archive(
+    root: Path,
+    plan: Mapping[str, Any],
+    config: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    wal: _WalCursor,
+) -> None:
+    source_parent_fd, source_fd, source_name = _open_directory_descriptor(root, plan["source"], config)
+    destination_parent_fd: Optional[int] = None
+    temporary_fd: Optional[int] = None
+    temporary_name = f".workspace-organizer-{plan['plan_id'][:16]}.tmp"
+    installed = False
+    temporary_created = False
+    try:
+        source_snapshot = _snapshot_tree_descriptor(source_fd, plan["source"])
+        if not _same_snapshot(source_snapshot, plan["source_snapshot"]):
+            raise _error(plan["source"], "archive source changed after plan approval")
+        destination_parent_fd, destination_name = _open_parent_descriptor_journaled(
+            root, plan["destination"], config=config, wal=wal
+        )
+        if _normalized_entry_at(destination_parent_fd, destination_name, plan["destination"]) is not None:
+            raise _error(plan["destination"], "archive destination already exists")
+        wal.write("stage-archive-tree", {
+            "source": plan["source"],
+            "destination": plan["destination"],
+            "temporary_name": temporary_name,
+            "source_snapshot": source_snapshot,
+            "expected_destination_snapshot": _expected_archive_snapshot(plan),
+        })
+        if _normalized_entry_at(destination_parent_fd, temporary_name, plan["destination"]) is not None:
+            raise _error(plan["destination"], "controlled archive temporary target already exists")
+        os.mkdir(temporary_name, mode=0o700, dir_fd=destination_parent_fd)
+        temporary_created = True
+        os.fsync(destination_parent_fd)
+        temporary_fd = os.open(temporary_name, _DIRECTORY_FLAGS, dir_fd=destination_parent_fd)
+        destination_snapshot = _copy_archive_tree_to_temporary(source_fd, temporary_fd, plan)
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        wal.write("install-archive-tree", {
+            "source": plan["source"],
+            "destination": plan["destination"],
+            "destination_snapshot": destination_snapshot,
+            "rollback": "retain-source-until-fresh-destination-verification",
+        })
+        _rename_noreplace_at(destination_parent_fd, temporary_name, destination_name)
+        installed = True
+        temporary_created = False
+
+        fresh_parent_fd, fresh_fd, _ = _open_directory_descriptor(root, plan["destination"], config)
+        try:
+            fresh_snapshot = _snapshot_tree_descriptor(fresh_fd, plan["destination"])
+            installed_info = os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+            if not _same_identity(installed_info, os.fstat(fresh_fd)) or not _same_snapshot(
+                fresh_snapshot, destination_snapshot
+            ):
+                raise _error(plan["destination"], "fresh archive destination verification failed")
+        finally:
+            os.close(fresh_fd)
+            os.close(fresh_parent_fd)
+
+        after_config = dict(config)
+        if plan["adopted_source"]:
+            after_config["adopted_task_paths"] = [
+                path for path in config["adopted_task_paths"] if path != plan["source"]
+            ]
+            validate_config(after_config)
+            _replace_adopted_config(root, plan, config, after_config, wal)
+
+        if not _same_snapshot(
+            _snapshot_tree_descriptor(source_fd, plan["source"]), plan["source_snapshot"]
+        ):
+            raise _error(plan["source"], "archive source changed before removal")
+        wal.write("remove-archive-source", {
+            "source": plan["source"],
+            "destination": plan["destination"],
+            "source_snapshot": plan["source_snapshot"],
+            "destination_snapshot": destination_snapshot,
+            "config_before": config if plan["adopted_source"] else None,
+            "config_after": after_config if plan["adopted_source"] else None,
+            "rollback": {
+                "restore_from": plan["destination"],
+                "restore_to": plan["source"],
+                "task_record_before_base64": plan["task_record_before_base64"],
+            },
+        })
+        delete_destination_parent_fd, delete_destination_fd, _ = _open_directory_descriptor(
+            root, plan["destination"], after_config
+        )
+        try:
+            if not _same_identity(installed_info, os.fstat(delete_destination_fd)) or not _same_snapshot(
+                _snapshot_tree_descriptor(delete_destination_fd, plan["destination"]),
+                destination_snapshot,
+            ):
+                raise _error(plan["destination"], "archive destination binding changed before source removal")
+        finally:
+            os.close(delete_destination_fd)
+            os.close(delete_destination_parent_fd)
+        if not _same_identity(
+            os.fstat(source_fd),
+            os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False),
+        ) or not _same_snapshot(
+            _snapshot_tree_descriptor(source_fd, plan["source"]), plan["source_snapshot"]
+        ):
+            raise _error(plan["source"], "archive source binding changed at removal boundary")
+        _remove_approved_tree_at(
+            source_parent_fd, source_name, source_fd, plan["source_snapshot"]
+        )
+        wal.write("archive-source-removed", {
+            "source": plan["source"],
+            "destination": plan["destination"],
+            "destination_tree_sha256": destination_snapshot["tree_sha256"],
+        })
+        try:
+            os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise _error(plan["source"], "archive source removal did not persist")
+        final_parent_fd, final_fd, _ = _open_directory_descriptor(root, plan["destination"], after_config)
+        try:
+            if not _same_snapshot(
+                _snapshot_tree_descriptor(final_fd, plan["destination"]), destination_snapshot
+            ):
+                raise _error("archive", "post-archive destination verification failed")
+        finally:
+            os.close(final_fd)
+            os.close(final_parent_fd)
+        results.append({
+            "action": "archive_bundle",
+            "source": plan["source"],
+            "destination": plan["destination"],
+            "source_snapshot": plan["source_snapshot"],
+            "destination_snapshot": destination_snapshot,
+            "task_record_before_sha256": plan["task_record_before_sha256"],
+            "task_record_after_sha256": plan["task_record_after_sha256"],
+            "config_before": config if plan["adopted_source"] else None,
+            "config_after": after_config if plan["adopted_source"] else None,
+            "rollback": {
+                "restore_path": plan["source"],
+                "archived_path": plan["destination"],
+                "task_record_before_base64": plan["task_record_before_base64"],
+                "required_destination_tree_sha256": destination_snapshot["tree_sha256"],
+                "mode": "verified_exact_archive_rollback_only",
+            },
+            "verified": True,
+        })
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if destination_parent_fd is not None:
+            if temporary_created and not installed:
+                _cleanup_temporary_at(destination_parent_fd, temporary_name)
+            os.close(destination_parent_fd)
+        os.close(source_fd)
+        os.close(source_parent_fd)
 
 
 def apply_plan(root: Path, plan_path: Path, approval_path: Path) -> Dict[str, Any]:
     root = _workspace_root(root)
     plan, raw_plan = load_plan(plan_path)
-    _load_approval(approval_path, plan, raw_plan)
-    preflight = validate_plan_preconditions(root, plan)
+    _, raw_approval = _load_approval(approval_path, plan, raw_plan)
+    approval_sha256 = _sha256_bytes(raw_approval)
+    preflight = validate_plan_preconditions(
+        root, plan, plan_path=plan_path, raw_plan=raw_plan
+    )
     if preflight["status"] == "already_applied":
         if preflight["verification"].get("plan_sha256") != _sha256_bytes(raw_plan):
             raise _error("apply", "existing verification binds different plan bytes")
         return preflight["verification"]
-    record: Dict[str, Any] = {
-        "schema_version": 1,
-        "plan_id": plan["plan_id"],
-        "plan_sha256": _sha256_bytes(raw_plan),
-        "operation": plan["operation"],
-        "status": "failed",
-        "referenced_paths": _referenced_paths(plan),
-        "results": [],
-    }
-    results: List[Dict[str, Any]] = record["results"]
+
+    config_before: Optional[Dict[str, Any]] = None
+    config_after: Optional[Dict[str, Any]] = None
+    if plan["operation"] == "initialize":
+        config_after = dict(plan["config"])
+    else:
+        config_before = _verify_config_binding(root, plan)
+        config_after = dict(config_before)
+        if plan["operation"] == "archive" and plan["adopted_source"]:
+            config_after["adopted_task_paths"] = [
+                path for path in config_before["adopted_task_paths"] if path != plan["source"]
+            ]
+            validate_config(config_after)
+
+    journal = _open_journal(root, plan_path, plan, raw_plan)
     try:
-        if plan["operation"] == "initialize":
-            _apply_initialize(root, plan, results)
-        else:
-            config = _verify_config_binding(root, plan)
-            if plan["operation"] == "organize":
-                _apply_organize(root, plan, config, results)
-            else:
-                _apply_archive(root, plan, config, results)
-        if not all(result.get("verified") or result.get("post_apply", {}).get("verified") for result in results):
-            raise _error("apply", "one or more operations did not verify")
-        record.update({"status": "verified", "results": results})
-    except Exception as exc:
-        record["error"] = str(exc)
+        if journal.read("result") is not None or journal.read("intent") is not None:
+            raise _error("apply", "durable operation evidence already exists; blind retry is blocked")
+        intent = _make_intent(
+            plan, raw_plan, approval_sha256, config_before, config_after
+        )
+        _write_intent(journal, intent)
+        wal = _WalCursor(journal)
+        record: Dict[str, Any] = {
+            "schema_version": 1,
+            "record_type": "verification-result",
+            "plan_id": plan["plan_id"],
+            "plan_sha256": _sha256_bytes(raw_plan),
+            "approval_sha256": approval_sha256,
+            "operation": plan["operation"],
+            "status": "failed",
+            "referenced_paths": _referenced_paths(plan),
+            "journal_events": journal.events,
+            "results": [],
+        }
+        results: List[Dict[str, Any]] = record["results"]
         try:
-            _write_verification(root, record)
-        except Exception:
-            pass
-        raise
-    _write_verification(root, record)
-    return record
+            if plan["operation"] == "initialize":
+                _apply_initialize(root, plan, results, wal)
+            elif plan["operation"] == "organize":
+                assert config_before is not None
+                _apply_organize(root, plan, config_before, results, wal)
+            else:
+                assert config_before is not None
+                _apply_archive(root, plan, config_before, results, wal)
+            if not all(
+                result.get("verified") or result.get("post_apply", {}).get("verified")
+                for result in results
+            ):
+                raise _error("apply", "one or more operations did not verify")
+            record.update({
+                "status": "verified",
+                "journal_events": list(journal.events),
+                "results": results,
+            })
+            _write_result(journal, record)
+            return record
+        except BaseException as exc:
+            record.update({
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "journal_events": list(journal.events),
+                "results": results,
+            })
+            try:
+                _write_result(journal, record)
+            except BaseException:
+                pass
+            raise
+    finally:
+        journal.close()
 
 
 def verify_plan(root: Path, plan_path: Path) -> Dict[str, Any]:
     root = _workspace_root(root)
     plan, raw = load_plan(plan_path)
-    record = _load_existing_verification(root, plan)
+    record = _load_existing_verification(
+        root, plan, plan_path=plan_path, raw_plan=raw
+    )
     if record is None:
-        raise _error("verify", "no verification record exists for this plan")
+        raise _error("verify", "no durable result record exists for this plan")
+    if record.get("status") != "verified":
+        raise _error("verify", "operation is unfinished or failed")
     if record.get("plan_sha256") != _sha256_bytes(raw):
         raise _error("verify", "verification does not match exact plan bytes")
     _verify_completed(root, plan, record)
@@ -1510,6 +2579,8 @@ def verify_plan(root: Path, plan_path: Path) -> Dict[str, Any]:
 
 
 def _effective_material_sensitivity(relative: str, config: Mapping[str, Any]) -> str:
+    if any(_path_contains(root, relative) for root in ("10_收件箱", "99_待整理")):
+        return "restricted"
     values = [config["default_sensitivity"]]
     for item in config["adopted_material_roots"]:
         if _path_contains(item["path"], relative):
@@ -1560,6 +2631,8 @@ def _render_markdown(view: str, catalog: Mapping[str, Any]) -> bytes:
 
 
 def _material_item(root: Path, relative: str, role: str, task_id: Optional[str], sensitivity: str, config: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    if any(_path_contains(forbidden, relative) for forbidden in MATERIAL_INDEX_FORBIDDEN_ROOTS):
+        return None
     if sensitivity not in VISIBLE_SENSITIVITIES:
         return None
     path = _safe_existing(root, relative, config=config, kind="file")
@@ -1596,6 +2669,8 @@ def build_generated_outputs(root: Path) -> Dict[str, bytes]:
     library_roots = ["30_资料库"] + [item["path"] for item in config["adopted_material_roots"]]
     seen_material_paths = {item["path"] for item in materials}
     for material_root in library_roots:
+        if any(_paths_overlap(forbidden, material_root) for forbidden in MATERIAL_INDEX_FORBIDDEN_ROOTS):
+            raise _error(material_root, "material inventory must not enter a fixed or control-plane role")
         path = root.joinpath(*PurePosixPath(material_root).parts)
         if not path.exists():
             if material_root != "30_资料库":
@@ -1626,7 +2701,7 @@ def build_generated_outputs(root: Path) -> Dict[str, bytes]:
         for item in todo if item["due"] is not None
     ]
     timeline.sort(key=lambda item: (item["date"], PRIORITY_RANK[item["priority"]], item["id"]))
-    materials.sort(key=lambda item: _collision_key(item["path"]))
+    materials.sort(key=lambda item: _nfc(item["path"]))
     catalogs = {"todo": _catalog("todo", todo), "timeline": _catalog("timeline", timeline), "materials": _catalog("materials", materials)}
     outputs: Dict[str, bytes] = {}
     for view, catalog in catalogs.items():
@@ -1742,6 +2817,8 @@ def inspect_compressed(
     confirmed: bool,
     max_entries: int = 1000,
     max_total_bytes: int = 512 * 1024 * 1024,
+    max_source_bytes: int = DEFAULT_COMPRESSED_SOURCE_LIMIT,
+    max_metadata_bytes: int = DEFAULT_COMPRESSED_METADATA_LIMIT,
 ) -> Dict[str, Any]:
     if not confirmed:
         raise _error("compressed inspection", "explicit confirmation is required")
@@ -1750,9 +2827,10 @@ def inspect_compressed(
     relative = validate_relative_path(relative)
     if not (_path_contains("10_收件箱", relative) or _path_contains("99_待整理", relative)):
         raise _error(relative, "compressed originals may only be inspected from inbox or staging")
-    source = _safe_existing(root, relative, config=config, kind="file")
     if not _is_compressed(relative):
         raise _error(relative, "file extension is not a supported compressed-original type")
+    if min(max_entries, max_total_bytes, max_source_bytes, max_metadata_bytes) <= 0:
+        raise _error(relative, "compressed-inspection resource limits must be positive")
     entries: List[Dict[str, Any]] = []
     total = 0
 
@@ -1772,25 +2850,83 @@ def inspect_compressed(
             raise _error(relative, "archive exceeds configured metadata resource limits")
         entries.append({"path": name, "kind": kind, "bytes": size})
 
-    with tempfile.TemporaryDirectory(prefix="workspace-organizer-compressed-", dir="/tmp") as scratch:
-        scratch_path = Path(scratch)
-        if not scratch_path.resolve().is_relative_to(Path("/tmp").resolve()):
-            raise _error(relative, "compressed-inspection scratch escaped /tmp")
-        if zipfile.is_zipfile(source):
-            with zipfile.ZipFile(source) as archive:
-                for info in archive.infolist():
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    kind = "directory" if info.is_dir() else "file"
-                    if stat.S_ISLNK(mode):
-                        kind = "symlink"
-                    accept(info.filename, info.file_size, kind)
-        elif tarfile.is_tarfile(source):
-            with tarfile.open(source, mode="r:*") as archive:
-                for info in archive:
-                    kind = "directory" if info.isdir() else "file" if info.isfile() else "unsupported"
-                    accept(info.name, info.size, kind)
-        else:
-            raise _error(relative, "unsupported or malformed compressed original")
+    source_parent_fd, source_fd, _, source_before = _open_file_descriptor(root, relative, config)
+    try:
+        if source_before.st_size > max_source_bytes:
+            raise _error(relative, "compressed source exceeds configured byte limit")
+        with tempfile.TemporaryFile(
+            prefix="workspace-organizer-compressed-", dir="/tmp"
+        ) as scratch:
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            copied = 0
+            while True:
+                chunk = os.read(source_fd, min(1024 * 1024, max_source_bytes - copied + 1))
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > max_source_bytes:
+                    raise _error(relative, "compressed source exceeds configured byte limit")
+                scratch.write(chunk)
+            scratch.flush()
+            source_after = os.fstat(source_fd)
+            if (
+                not _same_identity(source_before, source_after)
+                or source_before.st_size != copied
+                or source_before.st_mtime_ns != source_after.st_mtime_ns
+                or source_before.st_ctime_ns != source_after.st_ctime_ns
+            ):
+                raise _error(relative, "compressed source changed during descriptor-bound snapshot")
+            scratch.seek(0)
+            is_zip = zipfile.is_zipfile(scratch)
+            scratch.seek(0)
+            if is_zip:
+                tail_size = min(copied, 65557)
+                scratch.seek(copied - tail_size)
+                tail = scratch.read(tail_size)
+                eocd_index = tail.rfind(b"PK\x05\x06")
+                if eocd_index < 0 or len(tail) - eocd_index < 22:
+                    raise _error(relative, "ZIP end-of-central-directory record is missing")
+                eocd_offset = copied - tail_size + eocd_index
+                (
+                    _, disk_number, central_disk, disk_entries, declared_entries,
+                    central_bytes, central_offset, comment_bytes,
+                ) = struct.unpack("<4s4H2LH", tail[eocd_index:eocd_index + 22])
+                if (
+                    disk_number != 0 or central_disk != 0 or disk_entries != declared_entries
+                    or declared_entries == 0xFFFF or central_bytes == 0xFFFFFFFF
+                    or central_offset == 0xFFFFFFFF
+                ):
+                    raise _error(relative, "split or ZIP64 archives are not supported for bounded inspection")
+                if eocd_offset + 22 + comment_bytes != copied:
+                    raise _error(relative, "ZIP has an abnormal trailing or comment declaration")
+                if central_offset + central_bytes != eocd_offset:
+                    raise _error(relative, "ZIP central-directory offsets are inconsistent")
+                if declared_entries > max_entries or central_bytes > max_metadata_bytes:
+                    raise _error(relative, "ZIP central-directory metadata exceeds configured limits")
+                scratch.seek(0)
+                with zipfile.ZipFile(scratch) as archive:
+                    infos = archive.infolist()
+                    if len(infos) != declared_entries:
+                        raise _error(relative, "ZIP entry count disagrees with its bounded declaration")
+                    for info in infos:
+                        mode = (info.external_attr >> 16) & 0xFFFF
+                        kind = "directory" if info.is_dir() else "file"
+                        if stat.S_ISLNK(mode):
+                            kind = "symlink"
+                        accept(info.filename, info.file_size, kind)
+            else:
+                scratch.seek(0)
+                try:
+                    archive = tarfile.open(fileobj=scratch, mode="r:*")
+                except tarfile.TarError as exc:
+                    raise _error(relative, "unsupported or malformed compressed original") from exc
+                with archive:
+                    for info in archive:
+                        kind = "directory" if info.isdir() else "file" if info.isfile() else "unsupported"
+                        accept(info.name, info.size, kind)
+    finally:
+        os.close(source_fd)
+        os.close(source_parent_fd)
     entries.sort(key=lambda item: _collision_key(item["path"]))
     seen: Dict[Tuple[str, ...], str] = {}
     for item in entries:
@@ -1806,6 +2942,13 @@ def inspect_compressed(
         "entries": entries,
         "entry_count": len(entries),
         "total_uncompressed_bytes": total,
+        "source_bytes": copied,
+        "limits": {
+            "max_entries": max_entries,
+            "max_total_bytes": max_total_bytes,
+            "max_source_bytes": max_source_bytes,
+            "max_metadata_bytes": max_metadata_bytes,
+        },
         "content_extracted": False,
         "source_mutated": False,
     }
@@ -1880,6 +3023,8 @@ def _parser() -> argparse.ArgumentParser:
     compressed.add_argument("--yes", action="store_true")
     compressed.add_argument("--max-entries", type=int, default=1000)
     compressed.add_argument("--max-total-bytes", type=int, default=512 * 1024 * 1024)
+    compressed.add_argument("--max-source-bytes", type=int, default=DEFAULT_COMPRESSED_SOURCE_LIMIT)
+    compressed.add_argument("--max-metadata-bytes", type=int, default=DEFAULT_COMPRESSED_METADATA_LIMIT)
     return parser
 
 
@@ -1920,6 +3065,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = inspect_compressed(
                 arguments.root, arguments.path, confirmed=arguments.yes,
                 max_entries=arguments.max_entries, max_total_bytes=arguments.max_total_bytes,
+                max_source_bytes=arguments.max_source_bytes,
+                max_metadata_bytes=arguments.max_metadata_bytes,
             )
         _emit(result)
         if arguments.command == "dry-run" and result.get("status") == "blocked":

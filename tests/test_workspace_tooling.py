@@ -88,6 +88,18 @@ def tree_evidence(root):
     return evidence
 
 
+def journal_records(root, plan_id):
+    control = root / ".workspace-organizer"
+    return sorted(control.rglob(f"{plan_id}.*.json")) if control.exists() else []
+
+
+def journal_record(root, plan_id, suffix):
+    matches = [path for path in journal_records(root, plan_id) if path.name == f"{plan_id}.{suffix}.json"]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one {suffix} record, found {matches}")
+    return json.loads(matches[0].read_text(encoding="utf-8"))
+
+
 class InitializationAndScanTests(unittest.TestCase):
     def test_initialize_adopts_exact_roots_without_moving_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -185,6 +197,75 @@ class InitializationAndScanTests(unittest.TestCase):
                 archive.writestr("../escape.txt", "synthetic")
             with self.assertRaises(tool.WorkspaceError):
                 tool.inspect_compressed(root, "10_收件箱/unsafe.zip", confirmed=True)
+
+    def test_adopted_roots_cannot_overlap_any_managed_role(self):
+        base = {
+            "schema_version": 1,
+            "workspace_id": "synthetic-workspace",
+            "default_sensitivity": "internal",
+            "adopted_task_paths": [],
+            "adopted_material_roots": [],
+            "exclude_paths": [],
+        }
+        for managed in tool.MANAGED_DIRECTORIES:
+            task_config = dict(base)
+            task_config["adopted_task_paths"] = [f"{managed}/adopted-task"]
+            with self.assertRaises(tool.WorkspaceError, msg=managed):
+                tool.validate_config(task_config)
+            material_config = dict(base)
+            material_config["adopted_material_roots"] = [{"path": managed, "sensitivity": "public"}]
+            with self.assertRaises(tool.WorkspaceError, msg=managed):
+                tool.validate_config(material_config)
+
+    def test_compressed_inspection_bounds_source_central_directory_and_entry_count(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_workspace(root)
+            archive_path = root / "10_收件箱" / "bounded.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("one.txt", "one")
+                archive.writestr("two.txt", "two")
+            with self.assertRaises(tool.WorkspaceError):
+                tool.inspect_compressed(root, "10_收件箱/bounded.zip", confirmed=True, max_entries=1)
+            with self.assertRaises(tool.WorkspaceError):
+                tool.inspect_compressed(root, "10_收件箱/bounded.zip", confirmed=True, max_metadata_bytes=32)
+            with self.assertRaises(tool.WorkspaceError):
+                tool.inspect_compressed(
+                    root,
+                    "10_收件箱/bounded.zip",
+                    confirmed=True,
+                    max_source_bytes=archive_path.stat().st_size - 1,
+                )
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are required")
+    def test_compressed_source_symlink_race_fails_before_external_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            make_workspace(root)
+            source = root / "10_收件箱" / "race.zip"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("safe.txt", "approved")
+            outside = base / "outside.zip"
+            with zipfile.ZipFile(outside, "w") as archive:
+                archive.writestr("secret.txt", "external-secret")
+            original_open = tool._open_file_descriptor
+            raced = {"done": False}
+
+            def race(*args, **kwargs):
+                if args[1] == "10_收件箱/race.zip" and not raced["done"]:
+                    raced["done"] = True
+                    source.unlink()
+                    os.symlink(outside, source)
+                return original_open(*args, **kwargs)
+
+            with mock.patch.object(tool, "_open_file_descriptor", side_effect=race):
+                with self.assertRaises((tool.WorkspaceError, OSError)):
+                    tool.inspect_compressed(root, "10_收件箱/race.zip", confirmed=True)
+            self.assertTrue(source.is_symlink())
+            with zipfile.ZipFile(outside) as archive:
+                self.assertIn(b"external-secret", archive.read("secret.txt"))
 
 
 class OrganizePipelineTests(unittest.TestCase):
@@ -298,20 +379,19 @@ class OrganizePipelineTests(unittest.TestCase):
             {"source": "10_收件箱/one.txt", "destination": "20_任务/sample-task/inputs/one.txt"},
             {"source": "10_收件箱/two.txt", "destination": "20_任务/sample-task/inputs/two.txt"},
         ])
-        original = tool._move_file_verified
+        original = tool._stage_file_at
         calls = {"count": 0}
 
-        def fail_second(source, destination, expected):
+        def fail_second(source_fd, destination_parent_fd, temporary_name, expected):
             calls["count"] += 1
             if calls["count"] == 2:
                 raise tool.WorkspaceError("injected verification interruption")
-            return original(source, destination, expected)
+            return original(source_fd, destination_parent_fd, temporary_name, expected)
 
-        with mock.patch.object(tool, "_move_file_verified", side_effect=fail_second):
+        with mock.patch.object(tool, "_stage_file_at", side_effect=fail_second):
             with self.assertRaises(tool.WorkspaceError):
                 tool.apply_plan(self.root, plan_path, approval)
-        verification = self.root / ".workspace-organizer" / "verification"
-        record = json.loads(next(verification.glob("*.json")).read_text(encoding="utf-8"))
+        record = journal_record(self.root, tool.load_plan(plan_path)[0]["plan_id"], "result")
         self.assertEqual(record["status"], "failed")
         self.assertEqual(len(record["results"]), 1)
         self.assertTrue(record["results"][0]["post_apply"]["verified"])
@@ -351,6 +431,123 @@ class OrganizePipelineTests(unittest.TestCase):
             tool.apply_plan(self.root, plan_path, approval)
         self.assertTrue(source.is_file())
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_intent_and_wal_write_failures_make_no_user_structure_changes(self):
+        source = self.root / "10_收件箱" / "input.txt"
+        source.write_text("synthetic", encoding="utf-8")
+        plan, plan_path, approval = self._plan([{
+            "source": "10_收件箱/input.txt", "destination": "99_待整理/new/input.txt"
+        }])
+        before = tree_evidence(self.root)
+        with mock.patch.object(tool, "_write_intent", side_effect=OSError("injected intent failure")):
+            with self.assertRaises(OSError):
+                tool.apply_plan(self.root, plan_path, approval)
+        self.assertEqual(tree_evidence(self.root), before)
+        self.assertEqual(journal_records(self.root, plan["plan_id"]), [])
+
+        with mock.patch.object(tool, "_write_wal_stage", side_effect=OSError("injected WAL failure")):
+            with self.assertRaises(OSError):
+                tool.apply_plan(self.root, plan_path, approval)
+        self.assertTrue(source.is_file())
+        self.assertFalse((self.root / "99_待整理" / "new").exists())
+        self.assertEqual(journal_record(self.root, plan["plan_id"], "result")["status"], "failed")
+        with self.assertRaises(tool.WorkspaceError):
+            tool.apply_plan(self.root, plan_path, approval)
+
+    def test_result_write_failure_leaves_discoverable_intent_and_blocks_retry(self):
+        source = self.root / "10_收件箱" / "result-failure.txt"
+        source.write_text("synthetic", encoding="utf-8")
+        plan, plan_path, approval = self._plan([{
+            "source": "10_收件箱/result-failure.txt",
+            "destination": "99_待整理/result-failure.txt",
+        }])
+        with mock.patch.object(tool, "_write_result", side_effect=OSError("injected result failure")):
+            with self.assertRaises(OSError):
+                tool.apply_plan(self.root, plan_path, approval)
+        self.assertFalse(source.exists())
+        self.assertTrue((self.root / "99_待整理" / "result-failure.txt").is_file())
+        self.assertEqual(journal_record(self.root, plan["plan_id"], "intent")["plan"], plan)
+        self.assertFalse(any(path.name.endswith(".result.json") for path in journal_records(self.root, plan["plan_id"])))
+        with self.assertRaises(tool.WorkspaceError):
+            tool.apply_plan(self.root, plan_path, approval)
+
+    def test_keyboard_interrupt_mid_copy_cleans_temporary_and_preserves_source(self):
+        source = self.root / "10_收件箱" / "interrupt.txt"
+        source.write_bytes(b"approved-content")
+        plan, plan_path, approval = self._plan([{
+            "source": "10_收件箱/interrupt.txt",
+            "destination": "20_任务/sample-task/inputs/interrupt.txt",
+        }])
+
+        def interrupt_copy(source_fd, destination_fd):
+            tool._write_all(destination_fd, b"partial")
+            raise KeyboardInterrupt("injected mid-copy interrupt")
+
+        with mock.patch.object(tool, "_copy_fd_data", side_effect=interrupt_copy):
+            with self.assertRaises(KeyboardInterrupt):
+                tool.apply_plan(self.root, plan_path, approval)
+        destination_parent = self.root / "20_任务" / "sample-task" / "inputs"
+        self.assertEqual(source.read_bytes(), b"approved-content")
+        self.assertFalse((destination_parent / "interrupt.txt").exists())
+        self.assertFalse(any(path.name.startswith(".workspace-organizer-") for path in destination_parent.iterdir()))
+        self.assertEqual(journal_record(self.root, plan["plan_id"], "result")["status"], "failed")
+        with self.assertRaises(tool.WorkspaceError):
+            tool.apply_plan(self.root, plan_path, approval)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are required")
+    def test_source_symlink_race_never_copies_external_content_or_deletes_link(self):
+        source = self.root / "10_收件箱" / "race.txt"
+        source.write_bytes(b"approved-content")
+        outside = self.base / "outside-secret.txt"
+        outside.write_bytes(b"external-secret")
+        plan, plan_path, approval = self._plan([{
+            "source": "10_收件箱/race.txt", "destination": "99_待整理/race.txt"
+        }])
+        original_wal = tool._write_wal_stage
+        raced = {"done": False}
+
+        def race(journal, sequence, stage, evidence):
+            original_wal(journal, sequence, stage, evidence)
+            if stage == "stage-file-copy" and not raced["done"]:
+                raced["done"] = True
+                source.unlink()
+                os.symlink(outside, source)
+
+        with mock.patch.object(tool, "_write_wal_stage", side_effect=race):
+            with self.assertRaises(tool.WorkspaceError):
+                tool.apply_plan(self.root, plan_path, approval)
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"external-secret")
+        self.assertEqual((self.root / "99_待整理" / "race.txt").read_bytes(), b"approved-content")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are required")
+    def test_destination_parent_symlink_race_never_writes_outside_or_deletes_source(self):
+        source = self.root / "10_收件箱" / "destination-race.txt"
+        source.write_bytes(b"approved-content")
+        outside = self.base / "outside-directory"
+        outside.mkdir()
+        plan, plan_path, approval = self._plan([{
+            "source": "10_收件箱/destination-race.txt",
+            "destination": "20_任务/sample-task/inputs/destination-race.txt",
+        }])
+        original_wal = tool._write_wal_stage
+        raced = {"done": False}
+        inputs = self.root / "20_任务" / "sample-task" / "inputs"
+        held = self.root / "20_任务" / "sample-task" / "inputs-held"
+
+        def race(journal, sequence, stage, evidence):
+            original_wal(journal, sequence, stage, evidence)
+            if stage == "remove-source-file" and not raced["done"]:
+                raced["done"] = True
+                inputs.rename(held)
+                os.symlink(outside, inputs)
+
+        with mock.patch.object(tool, "_write_wal_stage", side_effect=race):
+            with self.assertRaises(tool.WorkspaceError):
+                tool.apply_plan(self.root, plan_path, approval)
+        self.assertEqual(source.read_bytes(), b"approved-content")
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual((held / "destination-race.txt").read_bytes(), b"approved-content")
 
 
 class IndexAndArchiveTests(unittest.TestCase):
@@ -497,17 +694,156 @@ class IndexAndArchiveTests(unittest.TestCase):
                 tool.apply_plan(self.root, plan_path, approval)
             self.assertTrue(bundle.exists())
             (bundle / "records").rmdir()
-            with mock.patch.object(tool, "_remove_empty_tree_after_verified_copy", side_effect=tool.WorkspaceError("injected stop")):
+            with mock.patch.object(tool, "_remove_approved_tree_at", side_effect=tool.WorkspaceError("injected stop")):
                 with self.assertRaises(tool.WorkspaceError):
                     tool.apply_plan(self.root, plan_path, approval)
             self.assertTrue(bundle.exists())
-            verification = self.root / ".workspace-organizer" / "verification" / f"{plan['plan_id']}.json"
-            failed = json.loads(verification.read_text(encoding="utf-8"))
+            failed = journal_record(self.root, plan["plan_id"], "result")
             self.assertEqual(failed["status"], "failed")
             self.assertIn(plan["source"], failed["referenced_paths"])
         finally:
             plan_path.unlink(missing_ok=True)
             plan_path.with_suffix(".approval.json").unlink(missing_ok=True)
+
+    def test_materials_use_nfc_codepoint_order_and_exclude_fixed_sensitive_roles(self):
+        write_task(self.root / "20_任务" / "sample-task", task_data("sample-task", sensitivity="public"))
+        library = self.root / "30_资料库"
+        (library / "a.txt").write_text("a", encoding="utf-8")
+        (library / "Z.txt").write_text("Z", encoding="utf-8")
+        (self.root / "10_收件箱" / "inbox-secret.txt").write_text("secret", encoding="utf-8")
+        (self.root / ".workspace-organizer" / "control-secret.txt").write_text("secret", encoding="utf-8")
+        outputs = tool.build_generated_outputs(self.root)
+        catalog = json.loads(outputs[".workspace-organizer/catalog/materials.json"].decode("utf-8"))
+        paths = [item["path"] for item in catalog["items"]]
+        self.assertLess(paths.index("30_资料库/Z.txt"), paths.index("30_资料库/a.txt"))
+        self.assertFalse(any("inbox-secret" in path or "control-secret" in path for path in paths))
+
+    def test_archive_plan_rejects_title_body_and_other_metadata_tampering(self):
+        bundle = self.root / "20_任务" / "closed-task"
+        write_task(bundle, task_data("closed-task", status="completed", due=None))
+        plan = tool.build_archive_plan(self.root, "closed-task", "2026-08-17T11:00:00+08:00")
+        before_after = base64.b64decode(plan["task_record_after_base64"])
+        after_data, after_body = tool.parse_task_bytes(before_after)
+        mutations = []
+        changed_title = dict(after_data)
+        changed_title["title"] = "Tampered title"
+        mutations.append(tool.serialize_task(changed_title, after_body))
+        changed_due = dict(after_data)
+        changed_due["due"] = "2027-01-01"
+        mutations.append(tool.serialize_task(changed_due, after_body))
+        mutations.append(tool.serialize_task(after_data, after_body + "tampered body\n"))
+        for index, after_bytes in enumerate(mutations):
+            malicious = dict(plan)
+            malicious["task_record_after_base64"] = base64.b64encode(after_bytes).decode("ascii")
+            malicious["task_record_after_sha256"] = tool._sha256_bytes(after_bytes)
+            malicious = tool._plan_with_id({key: value for key, value in malicious.items() if key != "plan_id"})
+            path = Path(self.temporary.name).parent / f"tampered-archive-{index}-{next(tempfile._get_candidate_names())}.json"
+            try:
+                tool.write_immutable_json(path, malicious)
+                with self.assertRaises(tool.WorkspaceError):
+                    tool.approve_plan(path, path.with_suffix(".approval.json"), confirmed=True)
+            finally:
+                path.unlink(missing_ok=True)
+                path.with_suffix(".approval.json").unlink(missing_ok=True)
+
+    def test_archive_keyboard_interrupt_cleans_partial_temporary_tree(self):
+        bundle = self.root / "20_任务" / "closed-task"
+        write_task(bundle, task_data("closed-task", status="completed", area="research", due=None))
+        (bundle / "records").mkdir()
+        (bundle / "records" / "large.bin").write_bytes(b"approved-content")
+        plan = tool.build_archive_plan(self.root, "closed-task", "2026-08-17T11:00:00+08:00")
+        plan_path = Path(self.temporary.name).parent / f"archive-interrupt-{next(tempfile._get_candidate_names())}.json"
+        try:
+            approval = save_plan(plan_path, plan)
+
+            def interrupt_copy(source_fd, destination_fd):
+                tool._write_all(destination_fd, b"partial")
+                raise KeyboardInterrupt("injected archive copy interruption")
+
+            with mock.patch.object(tool, "_copy_fd_data", side_effect=interrupt_copy):
+                with self.assertRaises(KeyboardInterrupt):
+                    tool.apply_plan(self.root, plan_path, approval)
+            destination_parent = self.root / "90_归档" / "2026" / "research"
+            self.assertTrue(bundle.is_dir())
+            self.assertFalse((destination_parent / "closed-task").exists())
+            self.assertFalse(any(path.name.startswith(".workspace-organizer-") for path in destination_parent.iterdir()))
+            self.assertEqual(journal_record(self.root, plan["plan_id"], "result")["status"], "failed")
+        finally:
+            plan_path.unlink(missing_ok=True)
+            plan_path.with_suffix(".approval.json").unlink(missing_ok=True)
+
+    def test_adopted_archive_config_delete_gap_is_durable_and_blocks_retry(self):
+        adopted = self.root / "Legacy Tasks" / "adopted-task"
+        write_task(adopted, task_data("adopted-task", status="completed", area="research", due=None))
+        (adopted / "records").mkdir()
+        (adopted / "records" / "decision.txt").write_text("approved", encoding="utf-8")
+        config_path = self.root / ".workspace-organizer" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["adopted_task_paths"] = ["Legacy Tasks/adopted-task"]
+        config_path.write_bytes(tool._pretty_json(config))
+        plan = tool.build_archive_plan(self.root, "adopted-task", "2026-08-17T11:00:00+08:00")
+        plan_path = Path(self.temporary.name).parent / f"adopted-gap-{next(tempfile._get_candidate_names())}.json"
+        try:
+            approval = save_plan(plan_path, plan)
+            with mock.patch.object(
+                tool, "_remove_approved_tree_at", side_effect=KeyboardInterrupt("injected config/delete gap")
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    tool.apply_plan(self.root, plan_path, approval)
+            destination = self.root / "90_归档" / "2026" / "research" / "adopted-task"
+            self.assertTrue(adopted.is_dir())
+            self.assertTrue(destination.is_dir())
+            self.assertNotIn("Legacy Tasks/adopted-task", tool.load_config(self.root)["adopted_task_paths"])
+            result = journal_record(self.root, plan["plan_id"], "result")
+            self.assertEqual(result["status"], "failed")
+            wal_stages = [
+                json.loads(path.read_text(encoding="utf-8"))["stage"]
+                for path in journal_records(self.root, plan["plan_id"])
+                if ".wal-" in path.name
+            ]
+            self.assertIn("adopted-config-verified", wal_stages)
+            self.assertIn("remove-archive-source", wal_stages)
+            with self.assertRaises(tool.WorkspaceError):
+                tool.apply_plan(self.root, plan_path, approval)
+        finally:
+            plan_path.unlink(missing_ok=True)
+            plan_path.with_suffix(".approval.json").unlink(missing_ok=True)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are required")
+    def test_archive_destination_parent_race_never_writes_outside_or_deletes_source(self):
+        bundle = self.root / "20_任务" / "closed-task"
+        write_task(bundle, task_data("closed-task", status="completed", area="research", due=None))
+        (bundle / "records").mkdir()
+        (bundle / "records" / "decision.txt").write_text("approved", encoding="utf-8")
+        plan = tool.build_archive_plan(self.root, "closed-task", "2026-08-17T11:00:00+08:00")
+        plan_path = Path(self.temporary.name).parent / f"archive-race-{next(tempfile._get_candidate_names())}.json"
+        outside = Path(self.temporary.name).parent / f"outside-{next(tempfile._get_candidate_names())}"
+        outside.mkdir()
+        destination_parent = self.root / "90_归档" / "2026" / "research"
+        held_parent = self.root / "90_归档" / "2026" / "research-held"
+        original_wal = tool._write_wal_stage
+        raced = {"done": False}
+
+        def race(journal, sequence, stage, evidence):
+            original_wal(journal, sequence, stage, evidence)
+            if stage == "remove-archive-source" and not raced["done"]:
+                raced["done"] = True
+                destination_parent.rename(held_parent)
+                os.symlink(outside, destination_parent)
+
+        try:
+            approval = save_plan(plan_path, plan)
+            with mock.patch.object(tool, "_write_wal_stage", side_effect=race):
+                with self.assertRaises(tool.WorkspaceError):
+                    tool.apply_plan(self.root, plan_path, approval)
+            self.assertTrue(bundle.is_dir())
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertTrue((held_parent / "closed-task" / "TASK.md").is_file())
+            self.assertEqual(journal_record(self.root, plan["plan_id"], "result")["status"], "failed")
+        finally:
+            plan_path.unlink(missing_ok=True)
+            plan_path.with_suffix(".approval.json").unlink(missing_ok=True)
+            outside.rmdir()
 
 
 if __name__ == "__main__":
