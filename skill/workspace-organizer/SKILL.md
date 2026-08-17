@@ -17,7 +17,8 @@ making every structural change reviewable.
    nested Git repositories, normalized collisions, and ambiguous ownership.
 4. Select only the references needed for the request:
    - Read [references/initialization-and-adoption.md](references/initialization-and-adoption.md)
-     before initializing a workspace or adopting existing content.
+     before initializing a workspace, adopting existing content, or inspecting
+     compressed originals in inbox/staging areas.
    - Read [references/task-contract.md](references/task-contract.md) before creating
      or changing a task, status, metadata, or sensitivity.
    - Read [references/views-and-archive.md](references/views-and-archive.md) before
