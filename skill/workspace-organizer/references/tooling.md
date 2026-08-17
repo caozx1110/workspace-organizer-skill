@@ -41,6 +41,11 @@ python3 scripts/workspace_organizer.py apply ROOT --plan PLAN --approval APPROVA
 python3 scripts/workspace_organizer.py verify ROOT --plan PLAN
 ```
 
+The dry-run mutation list is complete: initialization includes the exact
+configuration target and digest, adopted archive includes the registration
+before/after transition, and organize reports every independently detectable
+source or destination error rather than stopping after the first collision.
+
 Apply rejects a missing, stale, altered, or mismatched plan/approval. Before the
 first workspace mutation it persists an immutable intent containing the exact
 plan digest, source/destination evidence, configuration transition (when
@@ -50,6 +55,12 @@ installation, configuration replacement, and source removal. Files and archive
 trees become visible at their final destination only after a verified temporary
 copy is complete. Source removal occurs only after reopening and verifying the
 installed destination through the workspace root.
+
+Removing an adopted-task registration uses an atomic exchange: the displaced
+configuration inode remains available as a verified backup until both the old
+and new bytes pass their transition-boundary checks. An identity or content
+change exchanges the prior inode back and retains durable evidence instead of
+silently overwriting a concurrent configuration update.
 
 Durable records normally live under `.workspace-organizer/verification/` (or
 the existing control directory when upgrading an older workspace without that
@@ -64,7 +75,14 @@ inputs for bounded manual recovery before preparing a new plan.
 ## Generate projections
 
 `index ROOT` validates all canonical inputs, filters sensitivity, builds all six
-catalog/Markdown outputs, and commits them as one recoverable replacement set.
+catalog/Markdown outputs, and stages them in a controlled transaction directory.
+Target parents remain bound by no-follow directory descriptors. At every commit
+boundary all six target identities and prior bytes are rechecked; existing
+targets use atomic exchange, while absent targets use atomic no-replace install.
+The displaced files serve as rollback backups. Any `BaseException`, including
+`KeyboardInterrupt`, rolls installed targets back in reverse order when they
+still match the transaction; concurrent user changes are never overwritten.
+Incomplete rollback evidence is retained under the cache for manual recovery.
 An unmarked overview, symlink, invalid record, collision, or write failure keeps
 the previous known-good set. Repeating an unchanged render performs no writes.
 

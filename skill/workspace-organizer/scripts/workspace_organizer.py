@@ -16,7 +16,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import struct
 import sys
@@ -1372,12 +1371,22 @@ def validate_plan_preconditions(
 
 def dry_run(root: Path, plan_path: Path) -> Dict[str, Any]:
     plan, raw = load_plan(plan_path)
+    root = _workspace_root(root)
     if plan["operation"] == "initialize":
-        intended = plan["operations"]
+        config_bytes = _pretty_json(plan["config"])
+        intended = list(plan["operations"]) + [{
+            "action": "write_config",
+            "path": ".workspace-organizer/config.json",
+            "sha256": _sha256_bytes(config_bytes),
+            "bytes": len(config_bytes),
+        }]
         excluded = plan["config"]["exclude_paths"]
     elif plan["operation"] == "organize":
         intended = plan["operations"]
-        excluded = load_config(_workspace_root(root))["exclude_paths"]
+        try:
+            excluded = load_config(root)["exclude_paths"]
+        except WorkspaceError:
+            excluded = []
     else:
         after_bytes = base64.b64decode(plan["task_record_after_base64"], validate=True)
         after_task, _ = parse_task_bytes(after_bytes, "plan TASK.md after")
@@ -1393,19 +1402,90 @@ def dry_run(root: Path, plan_path: Path) -> Dict[str, Any]:
             },
             {"action": "archive_bundle", "source": plan["source"], "destination": plan["destination"]},
         ]
-        excluded = load_config(_workspace_root(root))["exclude_paths"]
+        archive_config: Optional[Dict[str, Any]] = None
+        try:
+            archive_config = load_config(root)
+            excluded = archive_config["exclude_paths"]
+        except WorkspaceError:
+            excluded = []
+        if plan["adopted_source"]:
+            registration_update: Dict[str, Any] = {
+                "action": "update_config_registration",
+                "path": ".workspace-organizer/config.json",
+                "removed_path": plan["source"],
+            }
+            if archive_config is not None:
+                registration_update.update({
+                    "before": list(archive_config["adopted_task_paths"]),
+                    "after": [
+                        value for value in archive_config["adopted_task_paths"]
+                        if value != plan["source"]
+                    ],
+                })
+            intended.append(registration_update)
     errors: List[str] = []
     collisions: List[str] = []
+
+    def record(error: WorkspaceError) -> None:
+        message = str(error)
+        errors.append(message)
+        folded = message.casefold()
+        if "collid" in folded or ("destination" in folded and "exist" in folded):
+            collisions.append(message)
+
     try:
-        result = validate_plan_preconditions(root, plan, plan_path=plan_path, raw_plan=raw)
-        if result["status"] == "already_applied" and result["verification"].get("plan_sha256") != _sha256_bytes(raw):
-            raise _error("dry-run", "existing verification binds different plan bytes")
-        status = result["status"]
+        existing = _load_existing_verification(root, plan, plan_path=plan_path, raw_plan=raw)
     except WorkspaceError as exc:
+        record(exc)
+        existing = None
         status = "blocked"
-        errors.append(str(exc))
-        if "collid" in str(exc).casefold() or "destination" in str(exc).casefold() and "exist" in str(exc).casefold():
-            collisions.append(str(exc))
+    if errors:
+        pass
+    elif existing is not None:
+        if existing.get("status") == "verified":
+            try:
+                _verify_completed(root, plan, existing)
+                status = "already_applied"
+            except WorkspaceError as exc:
+                record(exc)
+                status = "blocked"
+        else:
+            record(_error("dry-run", "an unfinished or failed durable operation record already exists"))
+            status = "blocked"
+    elif plan["operation"] == "organize":
+        try:
+            config = _verify_config_binding(root, plan)
+            tasks = _registered_tasks(root, config, include_archived=False)
+        except WorkspaceError as exc:
+            record(exc)
+            config = None
+            tasks = []
+        if config is not None:
+            for operation in plan["operations"]:
+                try:
+                    _validate_organize_destination(operation["destination"], tasks)
+                except WorkspaceError as exc:
+                    record(exc)
+                try:
+                    current = _current_snapshot_for_operation(root, operation, config)
+                    if not _same_snapshot(current, operation["source_snapshot"]):
+                        raise _error(operation["source"], "source changed after plan generation")
+                except WorkspaceError as exc:
+                    record(exc)
+                try:
+                    _safe_destination(root, operation["destination"], config=config)
+                except WorkspaceError as exc:
+                    record(exc)
+        status = "blocked" if errors else "ready"
+    else:
+        try:
+            result = validate_plan_preconditions(
+                root, plan, plan_path=plan_path, raw_plan=raw
+            )
+            status = result["status"]
+        except WorkspaceError as exc:
+            record(exc)
+            status = "blocked"
     return {
         "schema_version": 1,
         "operation": "dry-run",
@@ -1539,6 +1619,7 @@ def _open_file_descriptor(
     parent_fd, name = _open_parent_descriptor(
         root, relative, config=config, create=False, internal_control=internal_control
     )
+    descriptor: Optional[int] = None
     try:
         descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
         info = os.fstat(descriptor)
@@ -1546,6 +1627,8 @@ def _open_file_descriptor(
             raise _error(relative, "must be a no-follow regular file")
         return parent_fd, descriptor, name, info
     except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
         os.close(parent_fd)
         raise
 
@@ -1673,29 +1756,77 @@ def _install_file_noreplace_at(parent_fd: int, temporary_name: str, final_name: 
     os.fsync(parent_fd)
 
 
-def _rename_noreplace_at(parent_fd: int, temporary_name: str, final_name: str) -> None:
-    if _normalized_entry_at(parent_fd, final_name, final_name) is not None:
-        raise _error(final_name, "destination already exists")
+def _rename_noreplace_between(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    if _normalized_entry_at(destination_parent_fd, destination_name, destination_name) is not None:
+        raise _error(destination_name, "destination already exists")
     library = ctypes.CDLL(None, use_errno=True)
-    source = os.fsencode(temporary_name)
-    destination = os.fsencode(final_name)
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
     result = -1
     if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
         function = library.renameatx_np
         function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         function.restype = ctypes.c_int
-        result = function(parent_fd, source, parent_fd, destination, 0x00000004 | 0x00000010)
+        result = function(
+            source_parent_fd, source, destination_parent_fd, destination,
+            0x00000004 | 0x00000010,
+        )
     elif hasattr(library, "renameat2"):
         function = library.renameat2
         function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         function.restype = ctypes.c_int
-        result = function(parent_fd, source, parent_fd, destination, 0x00000001)
+        result = function(
+            source_parent_fd, source, destination_parent_fd, destination, 0x00000001
+        )
     else:
-        raise _error(final_name, "this POSIX platform lacks atomic no-replace directory installation")
+        raise _error(destination_name, "this POSIX platform lacks atomic no-replace installation")
     if result != 0:
         error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), final_name)
-    os.fsync(parent_fd)
+        raise OSError(error_number, os.strerror(error_number), destination_name)
+    os.fsync(destination_parent_fd)
+    if source_parent_fd != destination_parent_fd:
+        os.fsync(source_parent_fd)
+
+
+def _rename_noreplace_at(parent_fd: int, temporary_name: str, final_name: str) -> None:
+    _rename_noreplace_between(parent_fd, temporary_name, parent_fd, final_name)
+
+
+def _exchange_entries_at(
+    left_parent_fd: int,
+    left_name: str,
+    right_parent_fd: int,
+    right_name: str,
+) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    left = os.fsencode(left_name)
+    right = os.fsencode(right_name)
+    result = -1
+    if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
+        function = library.renameatx_np
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(
+            left_parent_fd, left, right_parent_fd, right, 0x00000002 | 0x00000010
+        )
+    elif hasattr(library, "renameat2"):
+        function = library.renameat2
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        function.restype = ctypes.c_int
+        result = function(left_parent_fd, left, right_parent_fd, right, 0x00000002)
+    else:
+        raise _error(left_name, "this POSIX platform lacks atomic exchange")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), f"{left_name} <-> {right_name}")
+    os.fsync(left_parent_fd)
+    if left_parent_fd != right_parent_fd:
+        os.fsync(right_parent_fd)
 
 
 def _write_bytes_new_at(parent_fd: int, name: str, payload: bytes, mode: int = 0o600) -> Dict[str, Any]:
@@ -2260,14 +2391,23 @@ def _replace_adopted_config(
     )
     temporary_name = f".config.{plan['plan_id']}.tmp"
     temporary_created = False
+    exchanged = False
+    staged_info: Optional[os.stat_result] = None
+    staged_snapshot: Optional[Dict[str, Any]] = None
     try:
         try:
-            loaded = json.loads(_read_all(descriptor).decode("utf-8"))
+            original_bytes = _read_all(descriptor)
+            loaded = json.loads(original_bytes.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise _error("archive", f"configuration became unreadable: {exc}") from exc
         validate_config(loaded)
         if loaded != config_before or _sha256_bytes(_canonical_json(loaded)) != plan["config_sha256"]:
             raise _error("archive", "configuration changed before adopted-task update")
+        original_snapshot = {
+            "kind": "file",
+            "bytes": len(original_bytes),
+            "sha256": _sha256_bytes(original_bytes),
+        }
         payload = _pretty_json(config_after)
         wal.write("stage-adopted-config", {
             "path": ".workspace-organizer/config.json",
@@ -2276,8 +2416,9 @@ def _replace_adopted_config(
             "temporary_name": temporary_name,
             "after_sha256": _sha256_bytes(payload),
         })
-        _write_bytes_new_at(parent_fd, temporary_name, payload)
+        staged_snapshot = _write_bytes_new_at(parent_fd, temporary_name, payload)
         temporary_created = True
+        staged_info = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
         current_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_identity(current_info, original_info):
             raise _error("archive", "configuration identity changed before replacement")
@@ -2285,32 +2426,115 @@ def _replace_adopted_config(
             "path": ".workspace-organizer/config.json",
             "before": config_before,
             "after": config_after,
-            "rollback": "restore exact config_before before re-registering source",
+            "rollback": "atomically exchange back the exact prior inode before re-registering source",
         })
-        os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _exchange_entries_at(parent_fd, name, parent_fd, temporary_name)
+        exchanged = True
+        displaced_info = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_identity(displaced_info, original_info) or not _same_snapshot(
+            _snapshot_file_descriptor(descriptor, ".workspace-organizer/config.json"),
+            original_snapshot,
+        ):
+            raise _error(
+                "archive",
+                "configuration content or identity changed at the atomic transition boundary",
+            )
+
+        fresh_fd = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        try:
+            fresh_info = os.fstat(fresh_fd)
+            fresh_snapshot = _snapshot_file_descriptor(
+                fresh_fd, ".workspace-organizer/config.json"
+            )
+            fresh = json.loads(_read_all(fresh_fd).decode("utf-8"))
+        finally:
+            os.close(fresh_fd)
+        if (
+            staged_info is None or staged_snapshot is None
+            or not _same_identity(fresh_info, staged_info)
+            or not _same_snapshot(fresh_snapshot, staged_snapshot)
+            or fresh != config_after
+        ):
+            raise _error("archive", "new configuration changed during atomic installation")
+        wal.write("adopted-config-verified", {
+            "path": ".workspace-organizer/config.json",
+            "before_snapshot": original_snapshot,
+            "after_snapshot": staged_snapshot,
+            "after": config_after,
+            "backup_name": temporary_name,
+        })
+        wal.write("retire-adopted-config-backup", {
+            "path": ".workspace-organizer/config.json",
+            "backup_name": temporary_name,
+            "required_snapshot": original_snapshot,
+        })
+        backup_info = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _same_identity(backup_info, original_info) or not _same_snapshot(
+            _snapshot_file_descriptor(descriptor, temporary_name), original_snapshot
+        ):
+            raise _error("archive", "prior configuration backup changed before retirement")
+        current_fd = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        try:
+            current_info = os.fstat(current_fd)
+            current_snapshot = _snapshot_file_descriptor(current_fd, name)
+        finally:
+            os.close(current_fd)
+        if (
+            staged_info is None or staged_snapshot is None
+            or not _same_identity(current_info, staged_info)
+            or not _same_snapshot(current_snapshot, staged_snapshot)
+        ):
+            raise _error("archive", "new configuration changed before backup retirement")
+        os.unlink(temporary_name, dir_fd=parent_fd)
         temporary_created = False
+        exchanged = False
         os.fsync(parent_fd)
     except BaseException:
-        if temporary_created:
-            _cleanup_temporary_at(parent_fd, temporary_name)
+        if exchanged:
+            try:
+                _exchange_entries_at(parent_fd, name, parent_fd, temporary_name)
+                exchanged = False
+            except BaseException:
+                pass
+        if temporary_created and not exchanged and staged_info is not None and staged_snapshot is not None:
+            try:
+                temporary_info = os.stat(
+                    temporary_name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                temporary_fd = os.open(temporary_name, _READ_FLAGS, dir_fd=parent_fd)
+                try:
+                    temporary_snapshot = _snapshot_file_descriptor(
+                        temporary_fd, temporary_name
+                    )
+                finally:
+                    os.close(temporary_fd)
+                if _same_identity(temporary_info, staged_info) and _same_snapshot(
+                    temporary_snapshot, staged_snapshot
+                ):
+                    _cleanup_temporary_at(parent_fd, temporary_name)
+            except BaseException:
+                pass
         raise
     finally:
         os.close(descriptor)
         os.close(parent_fd)
-    fresh_parent_fd, fresh_fd, _, _ = _open_file_descriptor(
+
+
+def _verify_exact_config_descriptor(root: Path, expected: Mapping[str, Any]) -> None:
+    parent_fd, descriptor, _, _ = _open_file_descriptor(
         root, ".workspace-organizer/config.json", None, internal_control=True
     )
     try:
-        fresh = json.loads(_read_all(fresh_fd).decode("utf-8"))
-        if fresh != config_after:
-            raise _error("archive", "adopted-task configuration update failed verification")
+        try:
+            actual = json.loads(_read_all(descriptor).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise _error("archive", f"configuration became unreadable: {exc}") from exc
+        validate_config(actual)
+        if actual != expected:
+            raise _error("archive", "configuration changed before source removal")
     finally:
-        os.close(fresh_fd)
-        os.close(fresh_parent_fd)
-    wal.write("adopted-config-verified", {
-        "path": ".workspace-organizer/config.json",
-        "after": config_after,
-    })
+        os.close(descriptor)
+        os.close(parent_fd)
 
 
 def _apply_archive(
@@ -2399,6 +2623,8 @@ def _apply_archive(
                 "task_record_before_base64": plan["task_record_before_base64"],
             },
         })
+        if plan["adopted_source"]:
+            _verify_exact_config_descriptor(root, after_config)
         delete_destination_parent_fd, delete_destination_fd, _ = _open_directory_descriptor(
             root, plan["destination"], after_config
         )
@@ -2722,92 +2948,366 @@ def _valid_generated_marker(content: bytes, view: str) -> bool:
     ))
 
 
-def _replace(source: Path, destination: Path) -> None:
-    os.replace(source, destination)
+def _read_regular_entry_at(parent_fd: int, name: str, context: str) -> Tuple[bytes, os.stat_result, Dict[str, Any]]:
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise _error(context, "generated target must be a no-follow regular file")
+        content = _read_all(descriptor)
+        snapshot = {"kind": "file", "bytes": len(content), "sha256": _sha256_bytes(content)}
+        return content, info, snapshot
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _validate_generated_target(root: Path, relative: str) -> None:
-    parts = PurePosixPath(validate_relative_path(relative)).parts
-    current = root
-    for index, part in enumerate(parts):
-        matches = [entry for entry in current.iterdir() if _nfc(entry.name).casefold() == _nfc(part).casefold()] if current.exists() else []
-        if len(matches) > 1 or (matches and matches[0].name != part):
-            raise _error(relative, "generated output has a normalized path collision")
-        candidate = matches[0] if matches else current / part
-        if candidate.is_symlink():
-            raise _error(relative, "generated output path contains a symlink")
-        if candidate.exists() and index < len(parts) - 1 and not candidate.is_dir():
-            raise _error(relative, "generated output parent is not a directory")
-        current = candidate
+def _open_index_parent_descriptors(root: Path) -> Tuple[Dict[str, int], int]:
+    root_fd = os.open(root, _DIRECTORY_FLAGS)
+    overview_fd: Optional[int] = None
+    control_fd: Optional[int] = None
+    catalog_fd: Optional[int] = None
+    try:
+        overview_fd = _open_child_directory_at(root_fd, "00_总览", "00_总览", create=False)
+        control_fd = _open_child_directory_at(
+            root_fd, ".workspace-organizer", ".workspace-organizer", create=False
+        )
+        catalog_fd = _open_child_directory_at(
+            control_fd, "catalog", ".workspace-organizer/catalog", create=True
+        )
+        parents = {
+            "00_总览": overview_fd,
+            ".workspace-organizer/catalog": catalog_fd,
+        }
+        overview_fd = None
+        catalog_fd = None
+        result_control = control_fd
+        control_fd = None
+        return parents, result_control
+    except BaseException:
+        if overview_fd is not None:
+            os.close(overview_fd)
+        if catalog_fd is not None:
+            os.close(catalog_fd)
+        if control_fd is not None:
+            os.close(control_fd)
+        raise
+    finally:
+        os.close(root_fd)
+
+
+def _reopen_index_parent(root: Path, relative: str) -> int:
+    parent_fd, descriptor, _ = _open_directory_descriptor(
+        root,
+        relative,
+        None,
+        internal_control=relative.startswith(".workspace-organizer/"),
+    )
+    os.close(parent_fd)
+    return descriptor
+
+
+def _assert_index_parent_binding(root: Path, entry: Mapping[str, Any]) -> None:
+    fresh_fd = _reopen_index_parent(root, entry["parent_relative"])
+    try:
+        if not _same_identity(os.fstat(fresh_fd), entry["parent_info"]):
+            raise _error(entry["parent_relative"], "generated target parent binding changed")
+    finally:
+        os.close(fresh_fd)
+
+
+def _capture_index_entries(
+    root: Path,
+    outputs: Mapping[str, bytes],
+    parent_fds: Mapping[str, int],
+) -> List[Dict[str, Any]]:
+    markdown_views = {markdown: view for view, (_, markdown) in GENERATED_PATHS.items()}
+    entries: List[Dict[str, Any]] = []
+    for relative in sorted(outputs, key=_collision_key):
+        parts = PurePosixPath(validate_relative_path(relative)).parts
+        parent_relative = PurePosixPath(*parts[:-1]).as_posix()
+        parent_fd = parent_fds[parent_relative]
+        name = parts[-1]
+        existing = _normalized_entry_at(parent_fd, name, relative)
+        prior_bytes: Optional[bytes] = None
+        prior_info: Optional[os.stat_result] = None
+        prior_snapshot: Optional[Dict[str, Any]] = None
+        if existing is not None:
+            prior_bytes, prior_info, prior_snapshot = _read_regular_entry_at(
+                parent_fd, name, relative
+            )
+            view = markdown_views.get(relative)
+            if view is not None and not _valid_generated_marker(prior_bytes, view):
+                raise _error(relative, "existing overview is user-owned or has a different marker")
+        entries.append({
+            "relative": relative,
+            "parent_relative": parent_relative,
+            "parent_fd": parent_fd,
+            "parent_info": os.fstat(parent_fd),
+            "name": name,
+            "new_bytes": outputs[relative],
+            "new_snapshot": {
+                "kind": "file",
+                "bytes": len(outputs[relative]),
+                "sha256": _sha256_bytes(outputs[relative]),
+            },
+            "prior_exists": existing is not None,
+            "prior_bytes": prior_bytes,
+            "prior_info": prior_info,
+            "prior_snapshot": prior_snapshot,
+            "expected_exists": existing is not None,
+            "expected_bytes": prior_bytes,
+            "expected_info": prior_info,
+            "installed": False,
+        })
+    return entries
+
+
+def _verify_index_entry(entry: Mapping[str, Any]) -> None:
+    parent_fd = entry["parent_fd"]
+    name = entry["name"]
+    existing = _normalized_entry_at(parent_fd, name, entry["relative"])
+    if not entry["expected_exists"]:
+        if existing is not None:
+            raise _error(entry["relative"], "generated target appeared concurrently")
+        return
+    if existing is None:
+        raise _error(entry["relative"], "generated target disappeared concurrently")
+    content, info, _ = _read_regular_entry_at(parent_fd, name, entry["relative"])
+    if (
+        entry["expected_info"] is None
+        or not _same_identity(info, entry["expected_info"])
+        or content != entry["expected_bytes"]
+    ):
+        raise _error(entry["relative"], "generated target identity or content changed concurrently")
+
+
+def _verify_index_states(root: Path, entries: Sequence[Mapping[str, Any]]) -> None:
+    checked_parents: set = set()
+    for entry in entries:
+        parent_relative = entry["parent_relative"]
+        if parent_relative not in checked_parents:
+            _assert_index_parent_binding(root, entry)
+            checked_parents.add(parent_relative)
+        _verify_index_entry(entry)
+
+
+def _create_index_transaction(cache_fd: int) -> Tuple[str, int]:
+    for _ in range(100):
+        name = f"index-{next(tempfile._get_candidate_names())}"
+        if _normalized_entry_at(cache_fd, name, ".workspace-organizer/cache") is not None:
+            continue
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=cache_fd)
+        except FileExistsError:
+            continue
+        os.fsync(cache_fd)
+        return name, os.open(name, _DIRECTORY_FLAGS, dir_fd=cache_fd)
+    raise _error("index", "cannot allocate a unique controlled transaction directory")
+
+
+def _install_index_target(
+    root: Path,
+    entries: Sequence[MutableMapping[str, Any]],
+    entry: MutableMapping[str, Any],
+    transaction_fd: int,
+    sequence: int,
+) -> None:
+    _verify_index_states(root, entries)
+    parent_fd = entry["parent_fd"]
+    stage_name = entry["stage_name"]
+    name = entry["name"]
+    if entry["prior_exists"]:
+        _exchange_entries_at(transaction_fd, stage_name, parent_fd, name)
+        entry["installed"] = True
+        entry["expected_exists"] = True
+        entry["expected_bytes"] = entry["new_bytes"]
+        entry["expected_info"] = entry["stage_info"]
+        try:
+            backup_bytes, backup_info, backup_snapshot = _read_regular_entry_at(
+                transaction_fd, stage_name, entry["relative"]
+            )
+            if (
+                entry["prior_info"] is None or entry["prior_snapshot"] is None
+                or not _same_identity(backup_info, entry["prior_info"])
+                or backup_bytes != entry["prior_bytes"]
+                or not _same_snapshot(backup_snapshot, entry["prior_snapshot"])
+            ):
+                raise _error(entry["relative"], "atomic exchange displaced unexpected target content")
+        except BaseException:
+            try:
+                _exchange_entries_at(transaction_fd, stage_name, parent_fd, name)
+                entry["installed"] = False
+                entry["expected_exists"] = entry["prior_exists"]
+                entry["expected_bytes"] = entry["prior_bytes"]
+                entry["expected_info"] = entry["prior_info"]
+            except BaseException:
+                pass
+            raise
+    else:
+        _rename_noreplace_between(transaction_fd, stage_name, parent_fd, name)
+        entry["installed"] = True
+        entry["expected_exists"] = True
+        entry["expected_bytes"] = entry["new_bytes"]
+        entry["expected_info"] = entry["stage_info"]
+    content, info, snapshot = _read_regular_entry_at(parent_fd, name, entry["relative"])
+    if (
+        not _same_identity(info, entry["stage_info"])
+        or content != entry["new_bytes"]
+        or not _same_snapshot(snapshot, entry["new_snapshot"])
+    ):
+        raise _error(entry["relative"], "installed generated target failed exact verification")
+    entry["expected_info"] = info
+    _write_bytes_new_at(
+        transaction_fd,
+        f"state-{sequence:03d}.json",
+        _pretty_json({
+            "schema_version": 1,
+            "sequence": sequence,
+            "path": entry["relative"],
+            "prior_sha256": entry["prior_snapshot"]["sha256"] if entry["prior_snapshot"] else None,
+            "installed_sha256": entry["new_snapshot"]["sha256"],
+        }),
+    )
+
+
+def _rollback_index_transaction(
+    root: Path,
+    entries: Sequence[MutableMapping[str, Any]],
+    transaction_fd: int,
+) -> List[str]:
+    failures: List[str] = []
+    for entry in reversed(entries):
+        if not entry["installed"]:
+            continue
+        try:
+            _assert_index_parent_binding(root, entry)
+            _verify_index_entry(entry)
+            parent_fd = entry["parent_fd"]
+            if entry["prior_exists"]:
+                backup_bytes, backup_info, backup_snapshot = _read_regular_entry_at(
+                    transaction_fd, entry["stage_name"], entry["relative"]
+                )
+                if (
+                    entry["prior_info"] is None or entry["prior_snapshot"] is None
+                    or not _same_identity(backup_info, entry["prior_info"])
+                    or backup_bytes != entry["prior_bytes"]
+                    or not _same_snapshot(backup_snapshot, entry["prior_snapshot"])
+                ):
+                    raise _error(entry["relative"], "rollback backup changed")
+                _exchange_entries_at(
+                    transaction_fd, entry["stage_name"], parent_fd, entry["name"]
+                )
+            else:
+                os.unlink(entry["name"], dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            entry["installed"] = False
+            entry["expected_exists"] = entry["prior_exists"]
+            entry["expected_bytes"] = entry["prior_bytes"]
+            entry["expected_info"] = entry["prior_info"]
+        except BaseException as exc:
+            failures.append(f"{entry['relative']}: {type(exc).__name__}: {exc}")
+    if not failures:
+        try:
+            _verify_index_states(root, entries)
+            if any(entry["installed"] for entry in entries):
+                raise _error("index", "one or more generated targets remain installed")
+        except BaseException as exc:
+            failures.append(f"post-rollback verification: {type(exc).__name__}: {exc}")
+    return failures
 
 
 def generate_indexes(root: Path) -> Dict[str, Any]:
     root = _workspace_root(root)
     outputs = build_generated_outputs(root)
-    for relative in outputs:
-        _validate_generated_target(root, relative)
-    for view, (_, markdown_relative) in GENERATED_PATHS.items():
-        target = root.joinpath(*PurePosixPath(markdown_relative).parts)
-        if target.exists() or target.is_symlink():
-            if target.is_symlink() or not target.is_file() or not _valid_generated_marker(target.read_bytes(), view):
-                raise _error(markdown_relative, "existing overview is user-owned or has a different marker")
-    if all(
-        (root.joinpath(*PurePosixPath(relative).parts)).is_file()
-        and not (root.joinpath(*PurePosixPath(relative).parts)).is_symlink()
-        and (root.joinpath(*PurePosixPath(relative).parts)).read_bytes() == content
-        for relative, content in outputs.items()
-    ):
+    parent_fds: Dict[str, int] = {}
+    control_fd: Optional[int] = None
+    cache_fd: Optional[int] = None
+    transaction_fd: Optional[int] = None
+    transaction_name: Optional[str] = None
+    cleanup_transaction = False
+    try:
+        parent_fds, control_fd = _open_index_parent_descriptors(root)
+        entries = _capture_index_entries(root, outputs, parent_fds)
+        _verify_index_states(root, entries)
+        if all(entry["prior_bytes"] == entry["new_bytes"] for entry in entries):
+            return {
+                "schema_version": 1,
+                "operation": "index",
+                "status": "already_current",
+                "outputs": [
+                    {"path": relative, "sha256": _sha256_bytes(content)}
+                    for relative, content in sorted(outputs.items())
+                ],
+            }
+        cache_fd = _open_child_directory_at(
+            control_fd, "cache", ".workspace-organizer/cache", create=True
+        )
+        transaction_name, transaction_fd = _create_index_transaction(cache_fd)
+        for sequence, entry in enumerate(entries, start=1):
+            stage_name = f"stage-{sequence:03d}"
+            stage_snapshot = _write_bytes_new_at(
+                transaction_fd, stage_name, entry["new_bytes"]
+            )
+            entry["stage_name"] = stage_name
+            entry["stage_info"] = os.stat(
+                stage_name, dir_fd=transaction_fd, follow_symlinks=False
+            )
+            if not _same_snapshot(stage_snapshot, entry["new_snapshot"]):
+                raise _error(entry["relative"], "staged generated target failed verification")
+        _write_bytes_new_at(
+            transaction_fd,
+            "manifest.json",
+            _pretty_json({
+                "schema_version": 1,
+                "operation": "index",
+                "targets": [
+                    {
+                        "path": entry["relative"],
+                        "prior_sha256": entry["prior_snapshot"]["sha256"] if entry["prior_snapshot"] else None,
+                        "new_sha256": entry["new_snapshot"]["sha256"],
+                        "stage_name": entry["stage_name"],
+                    }
+                    for entry in entries
+                ],
+            }),
+        )
+        try:
+            for sequence, entry in enumerate(entries, start=1):
+                _install_index_target(root, entries, entry, transaction_fd, sequence)
+            _verify_index_states(root, entries)
+        except BaseException as exc:
+            rollback_failures = _rollback_index_transaction(root, entries, transaction_fd)
+            if rollback_failures:
+                raise _error(
+                    "index",
+                    f"rollback incomplete; preserve .workspace-organizer/cache/{transaction_name}: {rollback_failures}",
+                ) from exc
+            cleanup_transaction = True
+            raise
+        cleanup_transaction = True
         return {
             "schema_version": 1,
             "operation": "index",
-            "status": "already_current",
-            "outputs": [{"path": relative, "sha256": _sha256_bytes(content)} for relative, content in sorted(outputs.items())],
+            "status": "verified",
+            "outputs": [
+                {"path": relative, "sha256": _sha256_bytes(content)}
+                for relative, content in sorted(outputs.items())
+            ],
         }
-    cache = _control_subdirectory(root, "cache", create=True)
-    transaction = Path(tempfile.mkdtemp(prefix="index-", dir=cache))
-    prior: Dict[str, Optional[bytes]] = {}
-    committed: List[str] = []
-    try:
-        for relative, content in outputs.items():
-            target = root.joinpath(*PurePosixPath(relative).parts)
-            prior[relative] = target.read_bytes() if target.exists() and target.is_file() and not target.is_symlink() else None
-            stage = transaction.joinpath(*PurePosixPath(relative).parts)
-            stage.parent.mkdir(parents=True, exist_ok=True)
-            with stage.open("xb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-        for relative in sorted(outputs, key=_collision_key):
-            target = root.joinpath(*PurePosixPath(relative).parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            stage = transaction.joinpath(*PurePosixPath(relative).parts)
-            _replace(stage, target)
-            committed.append(relative)
-        for relative, content in outputs.items():
-            target = root.joinpath(*PurePosixPath(relative).parts)
-            if not target.is_file() or target.is_symlink() or _sha256_file(target) != _sha256_bytes(content):
-                raise _error(relative, "generated output failed post-commit verification")
-    except Exception:
-        for relative in reversed(committed):
-            target = root.joinpath(*PurePosixPath(relative).parts)
-            old = prior[relative]
-            if old is None:
-                if target.exists() and target.is_file() and not target.is_symlink():
-                    target.unlink()
-            else:
-                restore = transaction / "restore" / PurePosixPath(relative)
-                restore.parent.mkdir(parents=True, exist_ok=True)
-                restore.write_bytes(old)
-                os.replace(restore, target)
-        raise
     finally:
-        shutil.rmtree(transaction, ignore_errors=True)
-    return {
-        "schema_version": 1,
-        "operation": "index",
-        "status": "verified",
-        "outputs": [{"path": relative, "sha256": _sha256_bytes(content)} for relative, content in sorted(outputs.items())],
-    }
+        if transaction_fd is not None:
+            os.close(transaction_fd)
+        if cleanup_transaction and cache_fd is not None and transaction_name is not None:
+            _remove_entry_tree_at(cache_fd, transaction_name)
+            os.fsync(cache_fd)
+        if cache_fd is not None:
+            os.close(cache_fd)
+        if control_fd is not None:
+            os.close(control_fd)
+        for descriptor in parent_fds.values():
+            os.close(descriptor)
 
 
 def inspect_compressed(

@@ -151,6 +151,25 @@ class InitializationAndScanTests(unittest.TestCase):
                 tool.apply_plan(root, plan_path, approval)
             self.assertEqual(tree_evidence(root), before)
 
+    def test_initialize_dry_run_discloses_config_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "workspace"
+            root.mkdir()
+            plan = tool.build_initialization_plan(root, "dry-run-workspace")
+            plan_path = base / "plan.json"
+            tool.write_immutable_json(plan_path, plan)
+            result = tool.dry_run(root, plan_path)
+            config_writes = [
+                item for item in result["intended_mutations"]
+                if item.get("action") == "write_config"
+            ]
+            self.assertEqual(len(config_writes), 1)
+            self.assertEqual(config_writes[0]["path"], ".workspace-organizer/config.json")
+            self.assertEqual(
+                config_writes[0]["sha256"], tool._sha256_bytes(tool._pretty_json(plan["config"]))
+            )
+
     def test_inventory_scan_is_stable_conservative_and_skips_boundaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -327,6 +346,30 @@ class OrganizePipelineTests(unittest.TestCase):
         self.assertEqual(dry["status"], "blocked")
         self.assertTrue(dry["collisions"])
         self.assertEqual(destination.read_text(encoding="utf-8"), "occupied")
+
+    def test_dry_run_aggregates_all_destination_collisions(self):
+        for name in ("one.txt", "two.txt"):
+            (self.root / "10_收件箱" / name).write_text(name, encoding="utf-8")
+        _, plan_path, _ = self._plan([
+            {"source": "10_收件箱/one.txt", "destination": "99_待整理/one.txt"},
+            {"source": "10_收件箱/two.txt", "destination": "99_待整理/two.txt"},
+        ])
+        (self.root / "99_待整理" / "one.txt").write_text("occupied-one", encoding="utf-8")
+        (self.root / "99_待整理" / "two.txt").write_text("occupied-two", encoding="utf-8")
+        result = tool.dry_run(self.root, plan_path)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(len(result["collisions"]), 2)
+        self.assertTrue(any("one.txt" in value for value in result["collisions"]))
+        self.assertTrue(any("two.txt" in value for value in result["collisions"]))
+
+    def test_open_file_descriptor_closes_non_regular_target(self):
+        target = self.root / "10_收件箱" / "not-a-file"
+        target.mkdir()
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(20):
+            with self.assertRaises(tool.WorkspaceError):
+                tool._open_file_descriptor(self.root, "10_收件箱/not-a-file", tool.load_config(self.root))
+        self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_approval_is_bound_to_exact_plan_bytes(self):
         source = self.root / "10_收件箱" / "input.txt"
@@ -614,25 +657,83 @@ class IndexAndArchiveTests(unittest.TestCase):
         data["next_action"] = "Changed synthetic action"
         data["updated"] = "2026-08-17T09:30:00+08:00"
         write_task(bundle, data)
-        real_replace = tool._replace
+        real_install = tool._install_index_target
         calls = {"count": 0}
 
-        def fail_mid_commit(source, destination):
+        def fail_mid_commit(root, entries, entry, transaction_fd, sequence):
             calls["count"] += 1
             if calls["count"] == 3:
-                raise OSError("injected index interruption")
-            real_replace(source, destination)
+                raise KeyboardInterrupt("injected index interruption")
+            real_install(root, entries, entry, transaction_fd, sequence)
 
-        with mock.patch.object(tool, "_replace", side_effect=fail_mid_commit):
-            with self.assertRaises(OSError):
+        with mock.patch.object(tool, "_install_index_target", side_effect=fail_mid_commit):
+            with self.assertRaises(KeyboardInterrupt):
                 tool.generate_indexes(self.root)
         self.assertEqual({path: path.read_bytes() for path in generated_paths}, prior)
+        cache = self.root / ".workspace-organizer" / "cache"
+        self.assertFalse(any(path.name.startswith("index-") for path in cache.iterdir()))
         user_overview = self.root / "00_总览" / "TODO.md"
         user_overview.write_text("# User TODO\n", encoding="utf-8")
         before = {path: path.read_bytes() for path in generated_paths}
         with self.assertRaises(tool.WorkspaceError):
             tool.generate_indexes(self.root)
         self.assertEqual({path: path.read_bytes() for path in generated_paths}, before)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are required")
+    def test_index_parent_symlink_race_never_writes_outside(self):
+        bundle = self.root / "20_任务" / "sample-task"
+        data = task_data()
+        write_task(bundle, data)
+        tool.generate_indexes(self.root)
+        data["next_action"] = "Changed synthetic action"
+        data["updated"] = "2026-08-17T09:30:00+08:00"
+        write_task(bundle, data)
+        outside = Path(self.temporary.name).parent / f"index-outside-{next(tempfile._get_candidate_names())}"
+        outside.mkdir()
+        overview = self.root / "00_总览"
+        held = self.root / "00_总览-held"
+        original_exchange = tool._exchange_entries_at
+        raced = {"done": False}
+
+        def race(left_parent_fd, left_name, right_parent_fd, right_name):
+            if right_name == "MATERIALS.md" and not raced["done"]:
+                raced["done"] = True
+                overview.rename(held)
+                os.symlink(outside, overview)
+            return original_exchange(left_parent_fd, left_name, right_parent_fd, right_name)
+
+        try:
+            with mock.patch.object(tool, "_exchange_entries_at", side_effect=race):
+                with self.assertRaises(tool.WorkspaceError):
+                    tool.generate_indexes(self.root)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertTrue((held / "TODO.md").is_file())
+        finally:
+            outside.rmdir()
+
+    def test_index_marked_target_swap_never_overwrites_user_file(self):
+        bundle = self.root / "20_任务" / "sample-task"
+        data = task_data()
+        write_task(bundle, data)
+        tool.generate_indexes(self.root)
+        data["next_action"] = "Changed synthetic action"
+        data["updated"] = "2026-08-17T09:30:00+08:00"
+        write_task(bundle, data)
+        target = self.root / "00_总览" / "TODO.md"
+        original_exchange = tool._exchange_entries_at
+        raced = {"done": False}
+
+        def race(left_parent_fd, left_name, right_parent_fd, right_name):
+            if right_name == "TODO.md" and not raced["done"]:
+                raced["done"] = True
+                target.unlink()
+                target.write_text("# Concurrent user TODO\n", encoding="utf-8")
+            return original_exchange(left_parent_fd, left_name, right_parent_fd, right_name)
+
+        with mock.patch.object(tool, "_exchange_entries_at", side_effect=race):
+            with self.assertRaises(tool.WorkspaceError):
+                tool.generate_indexes(self.root)
+        self.assertEqual(target.read_text(encoding="utf-8"), "# Concurrent user TODO\n")
 
     def test_archive_eligibility_apply_verification_and_rollback_evidence(self):
         bundle = self.root / "20_任务" / "closed-task"
@@ -805,6 +906,80 @@ class IndexAndArchiveTests(unittest.TestCase):
             self.assertIn("remove-archive-source", wal_stages)
             with self.assertRaises(tool.WorkspaceError):
                 tool.apply_plan(self.root, plan_path, approval)
+        finally:
+            plan_path.unlink(missing_ok=True)
+            plan_path.with_suffix(".approval.json").unlink(missing_ok=True)
+
+    def test_adopted_archive_dry_run_discloses_exact_registration_update(self):
+        adopted = self.root / "Legacy Tasks" / "adopted-task"
+        write_task(adopted, task_data("adopted-task", status="completed", due=None))
+        config_path = self.root / ".workspace-organizer" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["adopted_task_paths"] = ["Legacy Tasks/adopted-task"]
+        config_path.write_bytes(tool._pretty_json(config))
+        plan = tool.build_archive_plan(
+            self.root, "adopted-task", "2026-08-17T11:00:00+08:00"
+        )
+        plan_path = Path(self.temporary.name).parent / f"adopted-dry-{next(tempfile._get_candidate_names())}.json"
+        try:
+            tool.write_immutable_json(plan_path, plan)
+            result = tool.dry_run(self.root, plan_path)
+            updates = [
+                item for item in result["intended_mutations"]
+                if item.get("action") == "update_config_registration"
+            ]
+            self.assertEqual(updates, [{
+                "action": "update_config_registration",
+                "path": ".workspace-organizer/config.json",
+                "removed_path": "Legacy Tasks/adopted-task",
+                "before": ["Legacy Tasks/adopted-task"],
+                "after": [],
+            }])
+        finally:
+            plan_path.unlink(missing_ok=True)
+
+    def test_adopted_config_same_inode_race_is_restored_and_source_retained(self):
+        adopted = self.root / "Legacy Tasks" / "adopted-task"
+        write_task(adopted, task_data("adopted-task", status="completed", area="research", due=None))
+        (adopted / "records").mkdir()
+        (adopted / "records" / "decision.txt").write_text("approved", encoding="utf-8")
+        concurrent = self.root / "concurrent-exclusion"
+        concurrent.mkdir()
+        config_path = self.root / ".workspace-organizer" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["adopted_task_paths"] = ["Legacy Tasks/adopted-task"]
+        config_path.write_bytes(tool._pretty_json(config))
+        original_inode = config_path.stat().st_ino
+        plan = tool.build_archive_plan(
+            self.root, "adopted-task", "2026-08-17T11:00:00+08:00"
+        )
+        plan_path = Path(self.temporary.name).parent / f"config-race-{next(tempfile._get_candidate_names())}.json"
+        original_wal = tool._write_wal_stage
+        raced = {"done": False}
+
+        def race(journal, sequence, stage, evidence):
+            original_wal(journal, sequence, stage, evidence)
+            if stage == "install-adopted-config" and not raced["done"]:
+                raced["done"] = True
+                concurrent_config = json.loads(config_path.read_text(encoding="utf-8"))
+                concurrent_config["exclude_paths"] = ["concurrent-exclusion"]
+                with config_path.open("r+b") as stream:
+                    stream.seek(0)
+                    stream.write(tool._pretty_json(concurrent_config))
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+        try:
+            approval = save_plan(plan_path, plan)
+            with mock.patch.object(tool, "_write_wal_stage", side_effect=race):
+                with self.assertRaises(tool.WorkspaceError):
+                    tool.apply_plan(self.root, plan_path, approval)
+            self.assertEqual(config_path.stat().st_ino, original_inode)
+            self.assertEqual(tool.load_config(self.root)["exclude_paths"], ["concurrent-exclusion"])
+            self.assertIn("Legacy Tasks/adopted-task", tool.load_config(self.root)["adopted_task_paths"])
+            self.assertTrue(adopted.is_dir())
+            self.assertEqual(journal_record(self.root, plan["plan_id"], "result")["status"], "failed")
         finally:
             plan_path.unlink(missing_ok=True)
             plan_path.with_suffix(".approval.json").unlink(missing_ok=True)
