@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workspace Organizer"
+  short_description: "Organize durable tasks and workspace materials"
+  default_prompt: "Use $workspace-organizer to initialize or safely organize this workspace."
