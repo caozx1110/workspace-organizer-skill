@@ -23,6 +23,8 @@ making every structural change reviewable.
      or changing a task, status, metadata, or sensitivity.
    - Read [references/views-and-archive.md](references/views-and-archive.md) before
      indexing, regenerating views, checking archive eligibility, or archiving.
+   - Read [references/tooling.md](references/tooling.md) before invoking the
+     deterministic CLI or integrating its Python API.
 
 ## Preserve safety boundaries
 
@@ -59,8 +61,9 @@ every semantic edit, and leave the bundle path unchanged.
 ### Scan, organize, generate, or archive
 
 Delegate every mutation-heavy `scan -> proposal -> dry-run -> approval -> apply
--> verify` flow, plus `index` and `archive`, to the deterministic scripts supplied
-by the workspace-organizer tooling package. Do not reimplement those operations
+-> verify` flow, plus `index` and `archive`, to
+[`scripts/workspace_organizer.py`](scripts/workspace_organizer.py). Follow the
+CLI/API sequence in `references/tooling.md`; do not reimplement those operations
 with ad hoc shell commands or general-purpose file writes.
 
 If the deterministic scripts are not installed, stop after a read-only inspection

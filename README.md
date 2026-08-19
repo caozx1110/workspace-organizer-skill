@@ -12,5 +12,6 @@ python3 scripts/validate_workspace_model.py examples/workspace
 python3 -m unittest discover -s tests -v
 ```
 
-The installable skill and workspace-operation tooling are intentionally tracked
-as later delivery waves.
+The installable skill includes dependency-free workspace-operation tooling. Its
+CLI and approval sequence are documented in
+[`skill/workspace-organizer/references/tooling.md`](skill/workspace-organizer/references/tooling.md).

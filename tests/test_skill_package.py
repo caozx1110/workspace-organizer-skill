@@ -27,6 +27,8 @@ class SkillPackageTests(unittest.TestCase):
             "references/initialization-and-adoption.md",
             "references/task-contract.md",
             "references/views-and-archive.md",
+            "references/tooling.md",
+            "scripts/workspace_organizer.py",
             "assets/workspace-config.json",
             "assets/TASK.md",
             "assets/empty-generated-views/todo.json",
@@ -42,7 +44,7 @@ class SkillPackageTests(unittest.TestCase):
             if path.is_file()
         }
         self.assertEqual(actual, expected)
-        self.assertFalse((SKILL_ROOT / "scripts").exists())
+        self.assertTrue((SKILL_ROOT / "scripts" / "workspace_organizer.py").is_file())
 
     def test_skill_metadata_and_progressive_disclosure(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -57,6 +59,7 @@ class SkillPackageTests(unittest.TestCase):
             "references/initialization-and-adoption.md",
             "references/task-contract.md",
             "references/views-and-archive.md",
+            "references/tooling.md",
         ):
             self.assertIn(reference, text)
             self.assertTrue((SKILL_ROOT / reference).is_file())
