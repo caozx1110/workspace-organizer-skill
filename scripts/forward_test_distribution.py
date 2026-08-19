@@ -13,6 +13,96 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
+SENTINEL_ENV = "WORKSPACE_ORGANIZER_FORWARD_SECRET_SENTINEL"
+FORBIDDEN_ENV_NAMES = {
+    SENTINEL_ENV,
+    "AWS_ACCESS_KEY_ID",
+    "AWS_PROFILE",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_CONFIG_DIR",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GIT_ASKPASS",
+    "NETRC",
+    "PYTHONPATH",
+    "SSH_AUTH_SOCK",
+    "VIRTUAL_ENV",
+}
+PLATFORM_CHILD_ENV_NAMES = {"__CF_USER_TEXT_ENCODING"}
+
+
+def _minimal_environment(
+    isolated: Path,
+    ambient: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    if ambient is None:
+        ambient = os.environ
+    isolated_home = isolated / "home"
+    isolated_codex = isolated / "codex-home"
+    isolated_tmp = isolated / "tmp"
+    isolated_home.mkdir()
+    isolated_codex.mkdir()
+    isolated_tmp.mkdir()
+    environment = {
+        "PATH": os.defpath,
+        "HOME": str(isolated_home),
+        "CODEX_HOME": str(isolated_codex),
+        "TMPDIR": str(isolated_tmp),
+        "TEMP": str(isolated_tmp),
+        "TMP": str(isolated_tmp),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONUTF8": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    # Read no ambient values. The parameter exists so tests can prove that even
+    # a hostile ambient mapping cannot enter the child allowlist.
+    _ = ambient
+    return environment
+
+
+def _probe_environment(environment: Mapping[str, str]) -> dict[str, Any]:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os; "
+                f"names={json.dumps(sorted(FORBIDDEN_ENV_NAMES))}; "
+                f"allowed={json.dumps(sorted(set(environment) | PLATFORM_CHILD_ENV_NAMES))}; "
+                f"platform={json.dumps(sorted(PLATFORM_CHILD_ENV_NAMES))}; "
+                "print(json.dumps({"
+                "'present': sorted(name for name in names if name in os.environ), "
+                "'unexpected': sorted(name for name in os.environ if name not in allowed), "
+                "'platform': sorted(name for name in platform if name in os.environ)"
+                "}))"
+            ),
+        ],
+        env=dict(environment),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    if probe.returncode != 0:
+        raise RuntimeError("isolated environment probe failed")
+    value = json.loads(probe.stdout)
+    if value.get("present") or value.get("unexpected"):
+        raise RuntimeError(
+            "non-allowlisted environment variables reached a child process: "
+            + ", ".join(value.get("present", []) + value.get("unexpected", []))
+        )
+    return {
+        "sentinel_propagated": SENTINEL_ENV in value["present"],
+        "sensitive_names_present": value["present"],
+        "unexpected_names_present": value["unexpected"],
+        "platform_injected_names": value["platform"],
+    }
+
+
 def _run(
     command: Sequence[str],
     *,
@@ -143,19 +233,12 @@ def forward_test(repo_root: Path) -> dict[str, Any]:
         isolated = Path(temporary)
         consumer = isolated / "consumer-repository"
         consumer.mkdir()
-        isolated_home = isolated / "home"
-        isolated_codex = isolated / "codex-home"
-        isolated_home.mkdir()
-        isolated_codex.mkdir()
-        environment = dict(os.environ)
-        environment.update(
-            {
-                "HOME": str(isolated_home),
-                "CODEX_HOME": str(isolated_codex),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
-        )
-        environment.pop("PYTHONPATH", None)
+        ambient = {
+            name: "synthetic-ambient-value-must-not-propagate"
+            for name in FORBIDDEN_ENV_NAMES
+        }
+        environment = _minimal_environment(isolated, ambient)
+        environment_probe = _probe_environment(environment)
 
         proposal = _run(
             [
@@ -344,6 +427,7 @@ def forward_test(repo_root: Path) -> dict[str, Any]:
             "new_workspace": ["initialize", "task-record", "index"],
             "adopted_workspace": ["adopt-in-place", "index", "archive"],
             "private_machine_state_used": False,
+            "environment_probe": environment_probe,
             "dashboard_required": False,
         }
 

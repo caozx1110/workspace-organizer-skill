@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -179,8 +181,139 @@ class DistributionReadinessTests(unittest.TestCase):
                 installer.install_skill(source, linked_consumer, confirmed=True)
             self.assertEqual(list(outside.iterdir()), [])
 
+    def test_installer_fails_closed_when_target_parent_is_swapped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            consumer = base / "consumer"
+            skills = consumer / ".agents" / "skills"
+            skills.mkdir(parents=True)
+            moved_skills = consumer / ".agents" / "skills-original"
+            outside = base / "outside"
+            existing = outside / "workspace-organizer"
+            existing.mkdir(parents=True)
+            user_file = existing / "user-owned.txt"
+            user_file.write_text("preserve me\n", encoding="utf-8")
+
+            def swap_parent(stage: str) -> None:
+                if stage == "target-parents-opened":
+                    skills.rename(moved_skills)
+                    skills.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(installer.InstallError, "identity changed"):
+                installer.install_skill(
+                    REPO_ROOT / "skill" / "workspace-organizer",
+                    consumer,
+                    confirmed=True,
+                    _test_hook=swap_parent,
+                )
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertFalse((moved_skills / "workspace-organizer").exists())
+            self.assertFalse(any(moved_skills.glob(".workspace-organizer.install-*")))
+
+    def test_installer_never_follows_source_file_swapped_to_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "source"
+            shutil.copytree(REPO_ROOT / "skill" / "workspace-organizer", source)
+            consumer = base / "consumer"
+            consumer.mkdir()
+            outside = base / "outside-secret.txt"
+            outside.write_text("must never be copied\n", encoding="utf-8")
+            swapped = {"done": False}
+
+            def swap_source(stage: str) -> None:
+                if stage == "source-entry-statted:SKILL.md" and not swapped["done"]:
+                    source.joinpath("SKILL.md").rename(source / "SKILL.original")
+                    source.joinpath("SKILL.md").symlink_to(outside)
+                    swapped["done"] = True
+
+            with self.assertRaisesRegex(installer.InstallError, "changed before open"):
+                installer.install_skill(
+                    source,
+                    consumer,
+                    confirmed=True,
+                    _test_hook=swap_source,
+                )
+            destination = consumer / ".agents" / "skills" / "workspace-organizer"
+            self.assertFalse(destination.exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "must never be copied\n")
+
+    def test_installer_partial_failure_and_publish_collision_expose_no_partial_skill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = REPO_ROOT / "skill" / "workspace-organizer"
+            interrupted = base / "interrupted"
+            interrupted.mkdir()
+
+            def interrupt_after_staging(stage: str) -> None:
+                if stage == "staging-complete":
+                    raise RuntimeError("injected before publish")
+
+            with self.assertRaisesRegex(RuntimeError, "injected before publish"):
+                installer.install_skill(
+                    source,
+                    interrupted,
+                    confirmed=True,
+                    _test_hook=interrupt_after_staging,
+                )
+            self.assertFalse(
+                (interrupted / ".agents" / "skills" / "workspace-organizer").exists()
+            )
+
+            collided = base / "collided"
+            collided.mkdir()
+            user_bytes = b"user-owned destination\n"
+
+            def create_collision(stage: str) -> None:
+                if stage == "staging-complete":
+                    destination = collided / ".agents" / "skills" / "workspace-organizer"
+                    destination.mkdir()
+                    destination.joinpath("keep.txt").write_bytes(user_bytes)
+
+            with self.assertRaisesRegex(installer.InstallError, "destination appeared"):
+                installer.install_skill(
+                    source,
+                    collided,
+                    confirmed=True,
+                    _test_hook=create_collision,
+                )
+            self.assertEqual(
+                (collided / ".agents" / "skills" / "workspace-organizer" / "keep.txt").read_bytes(),
+                user_bytes,
+            )
+
     def test_public_docs_examples_skill_and_fixtures_are_safe_and_linked(self) -> None:
         self.assertEqual(public_check.validate_public_content(REPO_ROOT), [])
+
+    def test_public_scan_fails_closed_for_every_regular_file_and_link_boundary(self) -> None:
+        cases = {
+            "dot-env secret": ("docs/.env", ("GH_TOKEN=gh" + "p_" + "a" * 24).encode(), "GitHub token"),
+            "rst private path": ("docs/notes.rst", ("See /" + "Users/example/private.txt\n").encode(), "macOS home path"),
+            "extensionless secret": ("docs/credentials", b"password=synthetic-value\n", "assigned password"),
+            "invalid UTF-8": ("docs/invalid.data", b"\xff\xfe", "not UTF-8 text"),
+            "binary": ("docs/blob.bin", b"public\x00binary", "binary content"),
+            "large": ("docs/large.rst", b"L" * (public_check.MAX_PUBLIC_FILE_BYTES + 1), "exceeds public-file limit"),
+            "broken link": ("docs/broken.md", b"[broken](missing.md)\n", "broken local link"),
+            "escape link": ("docs/escape.md", b"[escape](../../outside.txt)\n", "link escapes repository"),
+        }
+        for name, (relative, payload, expected) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                target = root / relative
+                target.parent.mkdir(parents=True)
+                target.write_bytes(payload)
+                errors = public_check.validate_public_content(root)
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            docs = root / "docs"
+            docs.mkdir()
+            outside = root / "outside.txt"
+            outside.write_text("public synthetic\n", encoding="utf-8")
+            docs.joinpath("linked.txt").symlink_to(outside)
+            errors = public_check.validate_public_content(root)
+            self.assertTrue(any("must not be a symlink" in error for error in errors), errors)
 
     def test_isolated_installed_package_runs_representative_flows(self) -> None:
         result = forward_test.forward_test(REPO_ROOT)
@@ -188,6 +321,13 @@ class DistributionReadinessTests(unittest.TestCase):
         self.assertTrue(result["skill_discovered"])
         self.assertTrue(result["isolated_home"])
         self.assertFalse(result["private_machine_state_used"])
+        self.assertFalse(result["environment_probe"]["sentinel_propagated"])
+        self.assertEqual(result["environment_probe"]["sensitive_names_present"], [])
+        self.assertEqual(result["environment_probe"]["unexpected_names_present"], [])
+        self.assertTrue(
+            set(result["environment_probe"]["platform_injected_names"])
+            <= forward_test.PLATFORM_CHILD_ENV_NAMES
+        )
         self.assertFalse(result["dashboard_required"])
         self.assertEqual(
             result["new_workspace"], ["initialize", "task-record", "index"]
@@ -195,6 +335,27 @@ class DistributionReadinessTests(unittest.TestCase):
         self.assertEqual(
             result["adopted_workspace"], ["adopt-in-place", "index", "archive"]
         )
+
+    def test_forward_environment_is_minimal_and_child_probe_filters_sensitive_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            ambient = {
+                name: "synthetic-sensitive-value"
+                for name in forward_test.FORBIDDEN_ENV_NAMES
+            }
+            ambient.update({"PATH": "/developer/bin", "LANG": "C"})
+            environment = forward_test._minimal_environment(Path(temporary), ambient)
+            self.assertEqual(environment["PATH"], os.defpath)
+            self.assertTrue(forward_test.FORBIDDEN_ENV_NAMES.isdisjoint(environment))
+            self.assertNotIn("USER", environment)
+            self.assertNotIn("LOGNAME", environment)
+            probe = forward_test._probe_environment(environment)
+            self.assertFalse(probe["sentinel_propagated"])
+            self.assertEqual(probe["sensitive_names_present"], [])
+            self.assertEqual(probe["unexpected_names_present"], [])
+            self.assertTrue(
+                set(probe["platform_injected_names"])
+                <= forward_test.PLATFORM_CHILD_ENV_NAMES
+            )
 
     def test_gate_has_portable_optional_official_validator_and_no_release_action(self) -> None:
         gate = (REPO_ROOT / "scripts" / "run_release_gate.py").read_text(

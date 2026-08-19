@@ -57,10 +57,13 @@ path.
 ## Isolated forward-test boundary
 
 `scripts/forward_test_distribution.py` creates a disposable consumer repository,
-isolated `HOME` and `CODEX_HOME`, and an empty `PYTHONPATH`. It first requests an
-installation proposal, explicitly confirms the exact no-replace copy, discovers
-the skill only under the consumer repository's `.agents/skills`, and invokes the
-installed dependency-free CLI.
+isolated `HOME`, `CODEX_HOME`, and temporary directory, plus a minimal child
+environment built from an explicit allowlist. It does not inherit credential,
+profile, virtual-environment, Python-path, SSH-agent, or user-state variables; an
+actual child-process sentinel probe verifies that boundary. It first requests
+an installation proposal, explicitly confirms the descriptor-anchored staged
+copy and atomic no-replace publish, discovers the skill only under the consumer
+repository's `.agents/skills`, and invokes the installed dependency-free CLI.
 
 The test then exercises two real workspaces:
 

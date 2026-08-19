@@ -1,98 +1,413 @@
 #!/usr/bin/env python3
-"""Install the public skill package into one repository without overwriting it."""
+"""Install the public skill package with descriptor-anchored no-replace copy."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
-import shutil
+import os
+import secrets
+import stat
 import sys
-from pathlib import Path
-from typing import Optional, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 
 SKILL_NAME = "workspace-organizer"
+IGNORED_NAMES = {"__pycache__", ".DS_Store"}
+IGNORED_SUFFIXES = {".pyc", ".pyo"}
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_WRITE_NEW_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_Identity = Tuple[int, int, int]
+_TestHook = Optional[Callable[[str], None]]
 
 
 class InstallError(ValueError):
     """Raised when a safe, no-replace installation cannot continue."""
 
 
-def _resolved_directory(path: Path, label: str) -> Path:
+def _require_platform_guards() -> None:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise InstallError("installation requires POSIX O_DIRECTORY and O_NOFOLLOW")
+
+
+def _identity(value: os.stat_result) -> _Identity:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
+
+
+def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        _identity(before) == _identity(after)
+        and before.st_size == after.st_size
+        and before.st_mtime_ns == after.st_mtime_ns
+        and before.st_ctime_ns == after.st_ctime_ns
+    )
+
+
+def _open_directory_path(path: Path, label: str) -> Tuple[Path, int, _Identity]:
     if path.is_symlink():
-        raise InstallError(f"{label} must not be a symlink: {path}")
+        raise InstallError(f"{label} must not be a symlink")
+    lexical = Path(os.path.realpath(os.path.abspath(path)))
+    if lexical.anchor != os.sep:
+        raise InstallError(f"{label} must resolve from a POSIX root")
     try:
-        resolved = path.resolve(strict=True)
+        descriptor = os.open(os.sep, _DIRECTORY_FLAGS)
     except OSError as exc:
-        raise InstallError(f"{label} is not an existing directory: {path}") from exc
-    if not resolved.is_dir():
-        raise InstallError(f"{label} is not a directory: {path}")
-    return resolved
+        raise InstallError(f"{label} root cannot be opened safely") from exc
+    try:
+        for component in lexical.parts[1:]:
+            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode):
+                raise InstallError(f"{label} contains a symlink component")
+            if not stat.S_ISDIR(before.st_mode):
+                raise InstallError(f"{label} is not a directory")
+            child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            opened = os.fstat(child)
+            if _identity(before) != _identity(opened):
+                os.close(child)
+                raise InstallError(f"{label} changed while it was opened")
+            os.close(descriptor)
+            descriptor = child
+        opened = os.fstat(descriptor)
+        return lexical, descriptor, _identity(opened)
+    except (InstallError, OSError):
+        os.close(descriptor)
+        raise
 
 
-def _validate_source(source: Path) -> Path:
-    resolved = _resolved_directory(source, "skill source")
-    skill_file = resolved / "SKILL.md"
-    if not skill_file.is_file() or skill_file.is_symlink():
-        raise InstallError("skill source must contain a regular SKILL.md")
-    front_matter = skill_file.read_text(encoding="utf-8").split("---", 2)
+def _open_or_create_directory_at(parent_fd: int, name: str, label: str) -> Tuple[int, _Identity]:
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileExistsError:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(before.st_mode):
+        raise InstallError(f"{label} must not be a symlink")
+    if not stat.S_ISDIR(before.st_mode):
+        raise InstallError(f"{label} must be a real directory")
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise InstallError(f"{label} cannot be opened without following links") from exc
+    opened = os.fstat(descriptor)
+    if _identity(before) != _identity(opened):
+        os.close(descriptor)
+        raise InstallError(f"{label} changed while it was opened")
+    return descriptor, _identity(opened)
+
+
+def _assert_directory_at(parent_fd: int, name: str, expected: _Identity, label: str) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise InstallError(f"{label} disappeared before publish") from exc
+    if _identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+        raise InstallError(f"{label} identity changed before publish")
+
+
+def _assert_target_chain(
+    target_fd: int,
+    agents_fd: int,
+    agents_identity: _Identity,
+    skills_identity: _Identity,
+) -> None:
+    _assert_directory_at(target_fd, ".agents", agents_identity, "target .agents")
+    _assert_directory_at(agents_fd, "skills", skills_identity, "target .agents/skills")
+
+
+def _ignored(name: str) -> bool:
+    return name in IGNORED_NAMES or PurePosixPath(name).suffix in IGNORED_SUFFIXES
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write while staging skill")
+        view = view[written:]
+
+
+def _copy_regular_file(
+    source_parent_fd: int,
+    destination_parent_fd: int,
+    name: str,
+    relative: str,
+    before: os.stat_result,
+    test_hook: _TestHook,
+) -> None:
+    if test_hook is not None:
+        test_hook(f"source-entry-statted:{relative}")
+    try:
+        source_fd = os.open(name, _READ_FLAGS, dir_fd=source_parent_fd)
+    except OSError as exc:
+        raise InstallError(f"source entry changed before open: {relative}") from exc
+    destination_fd: Optional[int] = None
+    try:
+        opened = os.fstat(source_fd)
+        if not stat.S_ISREG(opened.st_mode) or _identity(before) != _identity(opened):
+            raise InstallError(f"source entry changed before copy: {relative}")
+        destination_fd = os.open(
+            name,
+            _WRITE_NEW_FLAGS,
+            stat.S_IMODE(opened.st_mode) & 0o777,
+            dir_fd=destination_parent_fd,
+        )
+        while True:
+            payload = os.read(source_fd, 1024 * 1024)
+            if not payload:
+                break
+            _write_all(destination_fd, payload)
+        os.fsync(destination_fd)
+        os.fchmod(destination_fd, stat.S_IMODE(opened.st_mode) & 0o777)
+        after = os.fstat(source_fd)
+        if not _same_file_snapshot(opened, after):
+            raise InstallError(f"source file changed during copy: {relative}")
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
+
+
+def _copy_directory_tree(
+    source_fd: int,
+    destination_fd: int,
+    relative_parent: str,
+    test_hook: _TestHook,
+) -> None:
+    initial_names = sorted(name for name in os.listdir(source_fd) if not _ignored(name))
+    for name in initial_names:
+        relative = f"{relative_parent}/{name}" if relative_parent else name
+        try:
+            before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise InstallError(f"source entry disappeared: {relative}") from exc
+        if stat.S_ISLNK(before.st_mode):
+            raise InstallError(f"source contains a symlink: {relative}")
+        if stat.S_ISDIR(before.st_mode):
+            if test_hook is not None:
+                test_hook(f"source-entry-statted:{relative}")
+            try:
+                child_source_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=source_fd)
+            except OSError as exc:
+                raise InstallError(f"source directory changed before open: {relative}") from exc
+            opened = os.fstat(child_source_fd)
+            if _identity(before) != _identity(opened):
+                os.close(child_source_fd)
+                raise InstallError(f"source directory changed before copy: {relative}")
+            try:
+                os.mkdir(name, mode=0o755, dir_fd=destination_fd)
+                child_destination_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=destination_fd)
+                try:
+                    _copy_directory_tree(child_source_fd, child_destination_fd, relative, test_hook)
+                    os.fsync(child_destination_fd)
+                finally:
+                    os.close(child_destination_fd)
+            finally:
+                os.close(child_source_fd)
+        elif stat.S_ISREG(before.st_mode):
+            _copy_regular_file(source_fd, destination_fd, name, relative, before, test_hook)
+        else:
+            raise InstallError(f"source contains a non-regular entry: {relative}")
+    final_names = sorted(name for name in os.listdir(source_fd) if not _ignored(name))
+    if final_names != initial_names:
+        raise InstallError(f"source directory changed during copy: {relative_parent or '.'}")
+
+
+def _read_regular_file_at(parent_fd: int, name: str, label: str) -> bytes:
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
+    except OSError as exc:
+        raise InstallError(f"staged package is missing {label}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise InstallError(f"staged {label} is not a regular file")
+        chunks = []
+        while True:
+            payload = os.read(descriptor, 1024 * 1024)
+            if not payload:
+                break
+            chunks.append(payload)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_staged_skill(staging_fd: int) -> None:
+    try:
+        text = _read_regular_file_at(staging_fd, "SKILL.md", "SKILL.md").decode("utf-8")
+    except UnicodeError as exc:
+        raise InstallError("staged SKILL.md is not UTF-8") from exc
+    front_matter = text.split("---", 2)
     if len(front_matter) < 3 or "\nname: workspace-organizer\n" not in (
         "\n" + front_matter[1].strip() + "\n"
     ):
         raise InstallError("SKILL.md does not declare name: workspace-organizer")
-    for path in resolved.rglob("*"):
-        if path.is_symlink():
-            raise InstallError(f"skill source contains a symlink: {path.relative_to(resolved)}")
-    return resolved
 
 
-def install_skill(source: Path, target_root: Path, *, confirmed: bool) -> dict:
-    source = _validate_source(source)
-    target_root = _resolved_directory(target_root, "target repository root")
-    agents_parent = target_root / ".agents"
-    skills_parent = agents_parent / "skills"
-    destination = skills_parent / SKILL_NAME
-    result = {
-        "schema_version": 1,
-        "operation": "install-skill",
-        "skill": SKILL_NAME,
-        "source": str(source),
-        "destination": str(destination),
-        "overwrite": False,
-        "delete": False,
-    }
-    if destination.exists() or destination.is_symlink():
-        raise InstallError(f"destination already exists; refusing to overwrite: {destination}")
-    if not confirmed:
-        return {**result, "status": "approval_required"}
-
-    for path, label in (
-        (agents_parent, "target .agents"),
-        (skills_parent, "target .agents/skills"),
-    ):
-        if path.is_symlink():
-            raise InstallError(f"{label} must not be a symlink")
-        if path.exists() and not path.is_dir():
-            raise InstallError(f"{label} must be a directory")
-        path.mkdir(exist_ok=True)
-        if path.is_symlink() or not path.is_dir():
-            raise InstallError(f"{label} must remain a real directory")
-        try:
-            path.resolve(strict=True).relative_to(target_root)
-        except ValueError as exc:
-            raise InstallError(f"{label} resolves outside the target repository") from exc
-    if destination.exists() or destination.is_symlink():
-        raise InstallError(f"destination appeared before install: {destination}")
-    try:
-        shutil.copytree(
-            source,
-            destination,
-            symlinks=False,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".DS_Store"),
+def _rename_noreplace_at(parent_fd: int, source_name: str, destination_name: str) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    result = -1
+    if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
+        function = library.renameatx_np
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        result = function(parent_fd, source, parent_fd, destination, 0x00000004 | 0x00000010)
+    elif hasattr(library, "renameat2"):
+        function = library.renameat2
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        result = function(parent_fd, source, parent_fd, destination, 0x00000001)
+    else:
+        raise InstallError("platform lacks atomic no-replace directory publish")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise InstallError("destination appeared during atomic publish")
+        raise InstallError("atomic no-replace publish failed") from OSError(
+            error_number, os.strerror(error_number)
         )
-    except FileExistsError as exc:
-        raise InstallError(f"destination appeared during install: {destination}") from exc
-    return {**result, "status": "installed"}
+    os.fsync(parent_fd)
+
+
+def _unpublish_owned_destination(
+    skills_fd: int,
+    published_identity: _Identity,
+    quarantine_name: str,
+) -> None:
+    try:
+        current = os.stat(SKILL_NAME, dir_fd=skills_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if _identity(current) != published_identity:
+        return
+    try:
+        _rename_noreplace_at(skills_fd, SKILL_NAME, quarantine_name)
+    except InstallError:
+        return
+
+
+def install_skill(
+    source: Path,
+    target_root: Path,
+    *,
+    confirmed: bool,
+    _test_hook: _TestHook = None,
+) -> Dict[str, object]:
+    _require_platform_guards()
+    source_lexical, source_fd, _ = _open_directory_path(source, "skill source")
+    target_lexical, target_fd, _ = _open_directory_path(
+        target_root, "target repository root"
+    )
+    agents_fd: Optional[int] = None
+    skills_fd: Optional[int] = None
+    staging_fd: Optional[int] = None
+    try:
+        result: Dict[str, object] = {
+            "schema_version": 1,
+            "operation": "install-skill",
+            "skill": SKILL_NAME,
+            "source": str(source_lexical),
+            "destination": str(target_lexical / ".agents" / "skills" / SKILL_NAME),
+            "overwrite": False,
+            "delete": False,
+        }
+        try:
+            existing = os.stat(
+                f".agents/skills/{SKILL_NAME}",
+                dir_fd=target_fd,
+                follow_symlinks=False,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            existing = None
+        if existing is not None:
+            raise InstallError("destination already exists; refusing to overwrite")
+        if not confirmed:
+            return {**result, "status": "approval_required"}
+
+        agents_fd, agents_identity = _open_or_create_directory_at(
+            target_fd, ".agents", "target .agents"
+        )
+        skills_fd, skills_identity = _open_or_create_directory_at(
+            agents_fd, "skills", "target .agents/skills"
+        )
+        if _test_hook is not None:
+            _test_hook("target-parents-opened")
+        _assert_target_chain(target_fd, agents_fd, agents_identity, skills_identity)
+        try:
+            os.stat(SKILL_NAME, dir_fd=skills_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise InstallError("destination already exists; refusing to overwrite")
+
+        staging_name = f".{SKILL_NAME}.install-{secrets.token_hex(12)}"
+        os.mkdir(staging_name, mode=0o700, dir_fd=skills_fd)
+        staging_fd = os.open(staging_name, _DIRECTORY_FLAGS, dir_fd=skills_fd)
+        staging_identity = _identity(os.fstat(staging_fd))
+        _copy_directory_tree(source_fd, staging_fd, "", _test_hook)
+        _validate_staged_skill(staging_fd)
+        os.fchmod(staging_fd, 0o755)
+        os.fsync(staging_fd)
+        if _test_hook is not None:
+            _test_hook("staging-complete")
+        _assert_target_chain(target_fd, agents_fd, agents_identity, skills_identity)
+        _assert_directory_at(
+            skills_fd,
+            staging_name,
+            staging_identity,
+            "installation staging directory",
+        )
+        _rename_noreplace_at(skills_fd, staging_name, SKILL_NAME)
+        try:
+            _assert_directory_at(skills_fd, SKILL_NAME, staging_identity, "published skill")
+            _assert_target_chain(target_fd, agents_fd, agents_identity, skills_identity)
+        except InstallError:
+            _unpublish_owned_destination(skills_fd, staging_identity, f"{staging_name}.failed")
+            raise
+        return {**result, "status": "installed"}
+    finally:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if skills_fd is not None:
+            os.close(skills_fd)
+        if agents_fd is not None:
+            os.close(agents_fd)
+        os.close(target_fd)
+        os.close(source_fd)
 
 
 def _parser() -> argparse.ArgumentParser:

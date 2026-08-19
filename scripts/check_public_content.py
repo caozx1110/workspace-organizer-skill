@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -24,7 +26,6 @@ PUBLIC_ENTRIES = (
     "tests/fixtures",
 )
 MAX_PUBLIC_FILE_BYTES = 512 * 1024
-TEXT_SUFFIXES = {".json", ".md", ".py", ".txt", ".yaml", ".yml"}
 MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 PRIVATE_PATTERNS = (
     ("macOS home path", re.compile(r"/(?:Users)/[^/\s]+/")),
@@ -42,11 +43,16 @@ PRIVATE_PATTERNS = (
 def public_files(repo_root: Path) -> Iterable[Path]:
     for entry in PUBLIC_ENTRIES:
         path = repo_root / entry
-        if path.is_file():
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
             yield path
         elif path.is_dir():
             for child in sorted(path.rglob("*")):
-                if child.is_file() or child.is_symlink():
+                try:
+                    mode = child.lstat().st_mode
+                except OSError:
+                    yield child
+                    continue
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                     yield child
 
 
@@ -65,21 +71,62 @@ def validate_public_content(repo_root: Path) -> list[str]:
         return ["no public files found"]
     for path in files:
         relative = path.relative_to(repo_root).as_posix()
-        if path.is_symlink():
+        try:
+            before = path.lstat()
+        except OSError as exc:
+            errors.append(f"{relative}: cannot stat public entry: {exc}")
+            continue
+        if stat.S_ISLNK(before.st_mode):
             errors.append(f"{relative}: public content must not be a symlink")
             continue
-        size = path.stat().st_size
+        if not stat.S_ISREG(before.st_mode):
+            errors.append(f"{relative}: public content must be a regular file")
+            continue
+        size = before.st_size
         if size > MAX_PUBLIC_FILE_BYTES:
             errors.append(
                 f"{relative}: {size} bytes exceeds public-file limit "
                 f"{MAX_PUBLIC_FILE_BYTES}"
             )
-        if path.suffix.lower() not in TEXT_SUFFIXES:
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as exc:
+            errors.append(f"{relative}: cannot read public file: {exc}")
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                errors.append(f"{relative}: public file changed before read")
+                continue
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            ):
+                errors.append(f"{relative}: public file changed during read")
+                continue
+            payload = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+        if b"\x00" in payload:
+            errors.append(f"{relative}: binary content is not allowed in public roots")
+            continue
+        try:
+            text = payload.decode("utf-8")
         except UnicodeError:
-            errors.append(f"{relative}: declared public text is not UTF-8")
+            errors.append(f"{relative}: public file is not UTF-8 text")
             continue
         for label, pattern in PRIVATE_PATTERNS:
             if pattern.search(text):

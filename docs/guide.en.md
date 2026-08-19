@@ -59,8 +59,11 @@ python3 scripts/install_skill.py --target-root "$WO_CONSUMER_REPO" --yes
 The installer creates
 `$WO_CONSUMER_REPO/.agents/skills/workspace-organizer` and refuses an existing
 destination or a symlinked package. It never updates, replaces, or removes an
-installed skill. Codex scans repository `.agents/skills` locations as described
-by the [official OpenAI skill documentation](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills).
+installed skill. Source and target traversal is descriptor-anchored and
+no-follow; a complete staged copy is published with one atomic no-replace
+rename. A race or partial failure exposes no final destination. Codex scans
+repository `.agents/skills` locations as described by the
+[official OpenAI skill documentation](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills).
 Restart Codex only if a newly installed skill does not appear.
 
 This is a local/repository-scoped installation, not a release or publication.

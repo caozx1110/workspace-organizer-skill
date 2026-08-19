@@ -52,7 +52,9 @@ python3 scripts/install_skill.py --target-root "$WO_CONSUMER_REPO" --yes
 ```
 
 安装器创建 `$WO_CONSUMER_REPO/.agents/skills/workspace-organizer`；如果目标已经存在
-或包中含符号链接，就拒绝继续。它不会更新、替换或移除已安装技能。Codex 会按
+或包中含符号链接，就拒绝继续。它不会更新、替换或移除已安装技能。
+来源与目标遍历均由目录描述符锚定且不跟随链接；完整 staging 副本只通过一次原子
+“不替换”重命名发布，竞态或部分失败不会暴露最终目标。Codex 会按
 [OpenAI 官方技能文档](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills)
 扫描仓库中的 `.agents/skills`。新技能未出现时才需要重启 Codex。
 
