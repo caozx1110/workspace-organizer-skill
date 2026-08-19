@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "classification": "public-synthetic",
+  "families": [
+    {
+      "id": "research-agent-safety",
+      "title": "研究 agent safety",
+      "type": "research",
+      "area": "research",
+      "workspace_status": "active",
+      "priority": "high",
+      "due": "2026-09-30",
+      "sensitivity": "public",
+      "next_action": "Review the synthetic protocol",
+      "material": {
+        "role": "inputs",
+        "path": "研究 question.md",
+        "content": "Public synthetic research question.\n"
+      }
+    },
+    {
+      "id": "review-paper-robustness",
+      "title": "Review a synthetic robustness paper",
+      "type": "review",
+      "area": "research",
+      "workspace_status": "waiting",
+      "priority": "urgent",
+      "due": "2026-08-28",
+      "sensitivity": "confidential",
+      "next_action": "Wait for the synthetic author response",
+      "material": {
+        "role": "records",
+        "path": "confidential-review-note.md",
+        "content": "Synthetic confidential review note.\n"
+      }
+    },
+    {
+      "id": "reimbursement-conference",
+      "title": "Reimburse a synthetic conference trip",
+      "type": "reimbursement",
+      "area": "administration",
+      "workspace_status": "completed",
+      "priority": "normal",
+      "due": null,
+      "sensitivity": "internal",
+      "next_action": null,
+      "material": {
+        "role": "records",
+        "path": "approval record.txt",
+        "content": "Synthetic reimbursement approval.\n"
+      }
+    },
+    {
+      "id": "presentation-quarterly-update",
+      "title": "Prepare the synthetic quarterly update",
+      "type": "presentation",
+      "area": "communication",
+      "workspace_status": "planned",
+      "priority": "normal",
+      "due": "2026-10-05",
+      "sensitivity": "public",
+      "next_action": "Draft the synthetic outline",
+      "material": {
+        "role": "deliverables",
+        "path": "outline v1.md",
+        "content": "Public synthetic presentation outline.\n"
+      }
+    },
+    {
+      "id": "competition-robotics",
+      "title": "Enter a synthetic robotics competition",
+      "type": "competition",
+      "area": "engineering",
+      "workspace_status": "blocked",
+      "priority": "high",
+      "due": "2026-11-12",
+      "sensitivity": "internal",
+      "next_action": "Resolve the synthetic parts constraint",
+      "material": {
+        "role": "work",
+        "path": "design notes.txt",
+        "content": "Synthetic competition design notes.\n"
+      }
+    },
+    {
+      "id": "collaboration-dataset",
+      "title": "Coordinate a synthetic external dataset",
+      "type": "collaboration",
+      "area": "partnerships",
+      "workspace_status": "active",
+      "priority": "normal",
+      "due": "2026-09-18",
+      "sensitivity": "internal",
+      "next_action": "Confirm the synthetic exchange format",
+      "material": {
+        "role": "records",
+        "path": "meeting notes.md",
+        "content": "Synthetic collaboration meeting notes.\n"
+      }
+    },
+    {
+      "id": "contract-vendor-renewal",
+      "title": "Close a synthetic vendor contract",
+      "type": "contract",
+      "area": "operations",
+      "workspace_status": "cancelled",
+      "priority": "low",
+      "due": null,
+      "sensitivity": "restricted",
+      "next_action": null,
+      "material": {
+        "role": "inputs",
+        "path": "restricted-terms.txt",
+        "content": "Synthetic restricted contract terms.\n"
+      }
+    }
+  ],
+  "difficult_cases": {
+    "organize_move": {
+      "source": "10_收件箱/资料 with spaces.txt",
+      "destination": "20_任务/research-agent-safety/inputs/资料 with spaces.txt",
+      "content": "Synthetic Unicode material.\n"
+    },
+    "large_placeholder": {
+      "path": "10_收件箱/large placeholder.bin",
+      "byte": "L",
+      "size": 4096,
+      "scan_hash_limit": 1024
+    },
+    "compressed_original": {
+      "path": "10_收件箱/synthetic bundle.zip",
+      "members": [
+        {
+          "path": "folder/资料.txt",
+          "content": "Synthetic archive member.\n"
+        },
+        {
+          "path": "folder/notes with spaces.md",
+          "content": "Synthetic archive notes.\n"
+        }
+      ]
+    },
+    "exact_duplicates": {
+      "paths": [
+        "10_收件箱/exact duplicate one.txt",
+        "10_收件箱/exact duplicate two.txt"
+      ],
+      "content": "synthetic-exact-duplicate\n"
+    },
+    "suspected_duplicates": [
+      {
+        "path": "10_收件箱/draft copy A.txt",
+        "content": "variant-A"
+      },
+      {
+        "path": "10_收件箱/draft copy B.txt",
+        "content": "variant-B"
+      }
+    ],
+    "temporary_file": {
+      "path": "99_待整理/session scratch.tmp",
+      "content": "Synthetic temporary content.\n"
+    },
+    "nested_git": {
+      "root": "vendor/synthetic-repository",
+      "protected_file": "vendor/synthetic-repository/private fixture.txt",
+      "content": "Synthetic nested repository content.\n"
+    }
+  }
+}
