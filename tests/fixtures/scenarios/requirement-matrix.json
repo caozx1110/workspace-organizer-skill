@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "suite": "workspace-organizer-scenarios",
+  "tests": [
+    "test_seven_families_share_one_schema_and_lifecycle",
+    "test_empty_initialization_full_pipeline_and_difficult_files",
+    "test_adopt_in_place_preserves_existing_content_and_archives_once",
+    "test_stale_and_collision_cases_leave_manifest_unchanged",
+    "test_index_failure_rolls_back_all_six_outputs",
+    "test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete"
+  ],
+  "issue_acceptance": [
+    {
+      "id": "ISSUE-5-AC-01",
+      "criterion": "Seven representative task families use one schema and lifecycle.",
+      "coverage": [
+        "test_seven_families_share_one_schema_and_lifecycle"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-02",
+      "criterion": "Empty initialization and adopt-in-place are covered end to end.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_adopt_in_place_preserves_existing_content_and_archives_once"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-03",
+      "criterion": "Unicode, spaces, large placeholders, compressed originals, duplicates, temporary files, nested Git, and sensitive material have explicit behavior.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-04",
+      "criterion": "Dry-run, approval, apply, verify, deterministic indexes, archive, and rollback evidence are exercised.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_adopt_in_place_preserves_existing_content_and_archives_once",
+        "test_index_failure_rolls_back_all_six_outputs"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-05",
+      "criterion": "Tests reject unapproved deletion, overwrite, movement, publication, and sensitive-data exposure.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_adopt_in_place_preserves_existing_content_and_archives_once",
+        "test_stale_and_collision_cases_leave_manifest_unchanged"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-06",
+      "criterion": "Unchanged inputs produce equivalent plans and generated views.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_adopt_in_place_preserves_existing_content_and_archives_once"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-07",
+      "criterion": "Every Epic success criterion and definition-of-done item maps to a repeatable scenario or focused test.",
+      "coverage": [
+        "test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete"
+      ]
+    },
+    {
+      "id": "ISSUE-5-AC-08",
+      "criterion": "Fixtures contain no private paths, credentials, personal records, proprietary datasets, or unintended large binaries.",
+      "coverage": [
+        "test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete"
+      ]
+    }
+  ],
+  "epic_success_criteria": [
+    {
+      "id": "EPIC-SC-01",
+      "criterion": "A new workspace has predictable human and machine structure.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files"
+      ]
+    },
+    {
+      "id": "EPIC-SC-02",
+      "criterion": "Stable ASCII task identifiers and canonical TASK.md records drive deterministic views.",
+      "coverage": [
+        "test_seven_families_share_one_schema_and_lifecycle",
+        "test_empty_initialization_full_pipeline_and_difficult_files"
+      ]
+    },
+    {
+      "id": "EPIC-SC-03",
+      "criterion": "All seven representative task families fit the shared lifecycle through type metadata.",
+      "coverage": [
+        "test_seven_families_share_one_schema_and_lifecycle"
+      ]
+    },
+    {
+      "id": "EPIC-SC-04",
+      "criterion": "File organization follows scan, proposal, dry-run, explicit approval, apply, and verify without automatic overwrite or deletion.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_stale_and_collision_cases_leave_manifest_unchanged"
+      ]
+    },
+    {
+      "id": "EPIC-SC-05",
+      "criterion": "Closed tasks archive once while ambiguous, duplicate, temporary, and compressed material stays isolated for confirmation.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_adopt_in_place_preserves_existing_content_and_archives_once"
+      ]
+    },
+    {
+      "id": "EPIC-SC-06",
+      "criterion": "Future read-only dashboard consumers use the generated-view interface rather than a second source of truth.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "tests.test_workspace_model.WorkspaceModelContractTests.test_generated_catalogs_match_normative_projection"
+      ]
+    }
+  ],
+  "epic_definition_of_done": [
+    {
+      "id": "EPIC-DOD-01",
+      "criterion": "The skill structural validator and complete repository test suite pass.",
+      "coverage": [
+        "gate:skill-quick-validator",
+        "gate:python3--m-unittest-discover"
+      ]
+    },
+    {
+      "id": "EPIC-DOD-02",
+      "criterion": "Initialization, adoption, task records, views, archive, and rollback behavior are covered.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_adopt_in_place_preserves_existing_content_and_archives_once",
+        "test_index_failure_rolls_back_all_six_outputs"
+      ]
+    },
+    {
+      "id": "EPIC-DOD-03",
+      "criterion": "Deterministic indexes locate canonical records and materials while large binaries may defer hashing during scan.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files"
+      ]
+    },
+    {
+      "id": "EPIC-DOD-04",
+      "criterion": "Destructive behavior is absent by default and approved moves retain verification and rollback evidence.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "test_stale_and_collision_cases_leave_manifest_unchanged"
+      ]
+    },
+    {
+      "id": "EPIC-DOD-05",
+      "criterion": "Representative task families need no task-specific lifecycle fork.",
+      "coverage": [
+        "test_seven_families_share_one_schema_and_lifecycle"
+      ]
+    },
+    {
+      "id": "EPIC-DOD-06",
+      "criterion": "Public examples and fixtures contain no private or proprietary material.",
+      "coverage": [
+        "test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete"
+      ]
+    },
+    {
+      "id": "EPIC-DOD-07",
+      "criterion": "v1 remains usable without HTML and exposes sensitivity-filtered canonical generated views for v2.",
+      "coverage": [
+        "test_empty_initialization_full_pipeline_and_difficult_files",
+        "tests.test_workspace_model.WorkspaceModelContractTests.test_sensitive_tasks_and_materials_do_not_affect_default_views"
+      ]
+    }
+  ]
+}
