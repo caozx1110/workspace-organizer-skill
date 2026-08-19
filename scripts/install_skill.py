@@ -417,6 +417,62 @@ def _published_install_visible(
     return True
 
 
+def _entry_identity_at(parent_fd: int, name: str) -> Optional[_Identity]:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return _identity(current)
+
+
+def _agents_directory_visible(
+    target_fd: int,
+    agents_identity: _Identity,
+) -> bool:
+    try:
+        _assert_directory_at(target_fd, ".agents", agents_identity, "target .agents")
+    except (InstallError, OSError):
+        return False
+    return True
+
+
+def _installation_state(
+    target_fd: int,
+    agents_fd: int,
+    agents_identity: _Identity,
+    skills_fd: int,
+    skills_identity: _Identity,
+    staging_name: str,
+    staging_identity: _Identity,
+) -> str:
+    """Reconstruct commit state from current paths; never trust control flow."""
+    try:
+        staged = _entry_identity_at(agents_fd, staging_name)
+        canonical = _entry_identity_at(skills_fd, SKILL_NAME)
+    except OSError:
+        return "unknown"
+    if (
+        staged == staging_identity
+        and canonical != staging_identity
+        and _agents_directory_visible(target_fd, agents_identity)
+    ):
+        return "quarantined"
+    if (
+        staged is None
+        and canonical == staging_identity
+        and _published_install_visible(
+            target_fd,
+            agents_fd,
+            agents_identity,
+            skills_fd,
+            skills_identity,
+            staging_identity,
+        )
+    ):
+        return "installed"
+    return "unknown"
+
+
 def _quarantine_relative(staging_name: str) -> str:
     return f".agents/{staging_name}"
 
@@ -436,6 +492,18 @@ def _raise_quarantined(
     if isinstance(cause, KeyboardInterrupt):
         raise KeyboardInterrupt(message) from cause
     raise InstallError(message) from cause
+
+
+def _installed_warning(result: Dict[str, object]) -> Dict[str, object]:
+    return {
+        **result,
+        "status": "installed-with-durability-warning",
+        "durability": "uncertain",
+        "warning": (
+            "the exact canonical install is visible, but operation completion or "
+            "parent durability could not be confirmed"
+        ),
+    }
 
 
 def _quarantine_published_skill(
@@ -489,8 +557,10 @@ def install_skill(
     staging_fd: Optional[int] = None
     staging_name: Optional[str] = None
     staging_identity: Optional[_Identity] = None
+    agents_identity: Optional[_Identity] = None
+    skills_identity: Optional[_Identity] = None
     owned: _OwnedManifest = {}
-    published = False
+    observed_commit = False
     try:
         result: Dict[str, object] = {
             "schema_version": 1,
@@ -574,53 +644,71 @@ def install_skill(
             skills_fd,
             SKILL_NAME,
         )
-        published = True
-        try:
-            if _test_hook is not None:
-                _test_hook("published")
-            if not _published_install_visible(
+        if (
+            _installation_state(
                 target_fd,
                 agents_fd,
                 agents_identity,
                 skills_fd,
                 skills_identity,
+                staging_name,
                 staging_identity,
-            ):
-                raise InstallError("published skill is not visible through the target path")
-            if _test_hook is not None:
-                _test_hook("before-publish-fsync")
-            try:
-                os.fsync(agents_fd)
-                os.fsync(skills_fd)
-            except OSError:
-                if _published_install_visible(
-                    target_fd,
-                    agents_fd,
-                    agents_identity,
-                    skills_fd,
-                    skills_identity,
-                    staging_identity,
-                ):
-                    return {
-                        **result,
-                        "status": "installed-with-durability-warning",
-                        "durability": "uncertain",
-                        "warning": (
-                            "the canonical install is visible, but parent durability "
-                            "could not be confirmed"
-                        ),
-                    }
-                raise
-            if not _published_install_visible(
+            )
+            != "installed"
+        ):
+            raise InstallError("published skill is not visible through the target path")
+        observed_commit = True
+        if _test_hook is not None:
+            _test_hook("published")
+        if _test_hook is not None:
+            _test_hook("before-publish-fsync")
+        os.fsync(agents_fd)
+        os.fsync(skills_fd)
+        if (
+            _installation_state(
                 target_fd,
                 agents_fd,
                 agents_identity,
                 skills_fd,
                 skills_identity,
+                staging_name,
                 staging_identity,
-            ):
-                raise InstallError("published skill changed after durability sync")
-        except BaseException as publish_error:
+            )
+            != "installed"
+        ):
+            raise InstallError("published skill changed after durability sync")
+        return {**result, "status": "installed"}
+    except BaseException as install_error:
+        if (
+            staging_name is not None
+            and staging_identity is not None
+            and agents_fd is not None
+            and agents_identity is not None
+            and skills_fd is not None
+            and skills_identity is not None
+        ):
+            actual_state = _installation_state(
+                target_fd,
+                agents_fd,
+                agents_identity,
+                skills_fd,
+                skills_identity,
+                staging_name,
+                staging_identity,
+            )
+            if actual_state == "installed":
+                return _installed_warning(result)
+            if actual_state == "quarantined":
+                _raise_quarantined(
+                    install_error,
+                    staging_name,
+                    after_publish=observed_commit,
+                )
+            if not observed_commit:
+                raise InstallError(
+                    "installation state is unknown; no content was deleted; inspect "
+                    "the target .agents and .agents/skills entries manually"
+                ) from install_error
             try:
                 _quarantine_published_skill(
                     agents_fd,
@@ -634,17 +722,9 @@ def install_skill(
                     f"{reconcile_error}; no content was deleted"
                 ) from reconcile_error
             _raise_quarantined(
-                publish_error,
-                staging_name,
-                after_publish=True,
-            )
-        return {**result, "status": "installed"}
-    except BaseException as install_error:
-        if not published and staging_name is not None:
-            _raise_quarantined(
                 install_error,
                 staging_name,
-                after_publish=False,
+                after_publish=True,
             )
         raise
     finally:

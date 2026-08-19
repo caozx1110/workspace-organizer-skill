@@ -63,9 +63,10 @@ python3 scripts/install_skill.py --target-root "$WO_CONSUMER_REPO" --yes
 [OpenAI 官方技能文档](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills)
 扫描仓库中的 `.agents/skills`。新技能未出现时才需要重启 Codex。
 
-确认安装通常返回 `installed`。如果原子重命名已经提交、但无法确认父目录的持久性，
-安装器会重新验证规范目标，并返回 `installed-with-durability-warning`；该结果仍表示安装
-成功，但应在系统重启后再次检查。
+确认安装通常返回 `installed`。如果原子重命名刚提交就发生报告中断，或无法确认父目录
+的持久性，安装器会根据两个目录条目及其身份重新构建状态。只有精确的规范目标可见且
+staging 条目不存在时，才返回 `installed-with-durability-warning`；该结果仍表示安装成功，
+但应在系统重启后再次检查。
 
 这是本地/仓库范围的安装，不是发布或发行。官方文档建议用插件做更广泛的可复用分发；
 插件打包不属于 v1，也不属于本仓库门禁。

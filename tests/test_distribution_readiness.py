@@ -505,6 +505,43 @@ class DistributionReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(installer.InstallError, "refusing to overwrite"):
                 installer.install_skill(source, consumer, confirmed=True)
 
+    def test_installer_reconstructs_commit_after_rename_wrapper_interrupts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = Path(temporary) / "consumer"
+            consumer.mkdir()
+            source = REPO_ROOT / "skill" / "workspace-organizer"
+            real_rename = installer._rename_noreplace_at
+
+            def commit_then_interrupt(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                real_rename(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+                if destination_name == installer.SKILL_NAME:
+                    raise KeyboardInterrupt("injected after committed rename")
+
+            with mock.patch.object(
+                installer,
+                "_rename_noreplace_at",
+                side_effect=commit_then_interrupt,
+            ):
+                result = installer.install_skill(source, consumer, confirmed=True)
+            self.assertEqual(result["status"], "installed-with-durability-warning")
+            self.assertEqual(result["durability"], "uncertain")
+            destination = consumer / ".agents" / "skills" / "workspace-organizer"
+            self.assertTrue((destination / "SKILL.md").is_file())
+            self.assertEqual(self.installer_quarantines(consumer), [])
+            self.assert_no_installer_artifacts(consumer)
+            with self.assertRaisesRegex(installer.InstallError, "refusing to overwrite"):
+                installer.install_skill(source, consumer, confirmed=True)
+
     def test_installer_moves_changed_post_publish_entry_out_of_skill_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             consumer = Path(temporary) / "consumer"
