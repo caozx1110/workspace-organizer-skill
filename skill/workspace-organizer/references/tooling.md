@@ -81,7 +81,11 @@ boundary all six target identities and prior bytes are rechecked; existing
 targets use atomic exchange, while absent targets use atomic no-replace install.
 The displaced files serve as rollback backups. Any `BaseException`, including
 `KeyboardInterrupt`, rolls installed targets back in reverse order when they
-still match the transaction; concurrent user changes are never overwritten.
+still match the transaction. Rollback atomically exchanges or moves each
+current target into the transaction before validating its inode and bytes; if
+the displaced file is concurrent user content, it is immediately restored and
+the transaction is retained. Concurrent user changes are never overwritten or
+unlinked.
 Incomplete rollback evidence is retained under the cache for manual recovery.
 An unmarked overview, symlink, invalid record, collision, or write failure keeps
 the previous known-good set. Repeating an unchanged render performs no writes.

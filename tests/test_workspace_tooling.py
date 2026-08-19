@@ -679,6 +679,98 @@ class IndexAndArchiveTests(unittest.TestCase):
             tool.generate_indexes(self.root)
         self.assertEqual({path: path.read_bytes() for path in generated_paths}, before)
 
+    def test_index_rollback_existing_target_race_restores_user_content_and_keeps_transaction(self):
+        bundle = self.root / "20_任务" / "sample-task"
+        data = task_data()
+        write_task(bundle, data)
+        tool.generate_indexes(self.root)
+        generated_paths = {
+            relative: self.root.joinpath(*Path(relative).parts)
+            for pair in tool.GENERATED_PATHS.values()
+            for relative in pair
+        }
+        prior = {relative: path.read_bytes() for relative, path in generated_paths.items()}
+        data["next_action"] = "Changed synthetic action"
+        data["updated"] = "2026-08-17T09:30:00+08:00"
+        write_task(bundle, data)
+        real_install = tool._install_index_target
+        real_exchange = tool._exchange_entries_at
+        installed = []
+        state = {"rolling_back": False, "raced": False}
+        user_bytes = b"concurrent-user-content\n"
+
+        def stop_after_three(root, entries, entry, transaction_fd, sequence):
+            if len(installed) == 3:
+                state["rolling_back"] = True
+                raise KeyboardInterrupt("injected after three installs")
+            real_install(root, entries, entry, transaction_fd, sequence)
+            installed.append(entry)
+
+        def race_after_rollback_verify(left_parent_fd, left_name, right_parent_fd, right_name):
+            if state["rolling_back"] and not state["raced"]:
+                victim = generated_paths[installed[-1]["relative"]]
+                victim.unlink()
+                victim.write_bytes(user_bytes)
+                state["raced"] = True
+            return real_exchange(left_parent_fd, left_name, right_parent_fd, right_name)
+
+        with mock.patch.object(tool, "_install_index_target", side_effect=stop_after_three):
+            with mock.patch.object(tool, "_exchange_entries_at", side_effect=race_after_rollback_verify):
+                with self.assertRaisesRegex(tool.WorkspaceError, "rollback incomplete; preserve"):
+                    tool.generate_indexes(self.root)
+        victim_relative = installed[-1]["relative"]
+        self.assertEqual(generated_paths[victim_relative].read_bytes(), user_bytes)
+        for entry in installed[:-1]:
+            self.assertEqual(
+                generated_paths[entry["relative"]].read_bytes(), prior[entry["relative"]]
+            )
+        transactions = list((self.root / ".workspace-organizer" / "cache").glob("index-*"))
+        self.assertEqual(len(transactions), 1)
+        self.assertTrue((transactions[0] / "manifest.json").is_file())
+
+    def test_index_rollback_absent_target_race_restores_user_content_and_keeps_transaction(self):
+        bundle = self.root / "20_任务" / "sample-task"
+        write_task(bundle, task_data())
+        generated_paths = {
+            relative: self.root.joinpath(*Path(relative).parts)
+            for pair in tool.GENERATED_PATHS.values()
+            for relative in pair
+        }
+        real_install = tool._install_index_target
+        real_rename = tool._rename_noreplace_between
+        installed = []
+        state = {"rolling_back": False, "raced": False}
+        user_bytes = b"concurrent-first-index-user-content\n"
+
+        def stop_after_three(root, entries, entry, transaction_fd, sequence):
+            if len(installed) == 3:
+                state["rolling_back"] = True
+                raise KeyboardInterrupt("injected after three first-index installs")
+            real_install(root, entries, entry, transaction_fd, sequence)
+            installed.append(entry)
+
+        def race_after_rollback_verify(source_parent_fd, source_name, destination_parent_fd, destination_name):
+            if state["rolling_back"] and not state["raced"]:
+                victim = generated_paths[installed[-1]["relative"]]
+                victim.unlink()
+                victim.write_bytes(user_bytes)
+                state["raced"] = True
+            return real_rename(
+                source_parent_fd, source_name, destination_parent_fd, destination_name
+            )
+
+        with mock.patch.object(tool, "_install_index_target", side_effect=stop_after_three):
+            with mock.patch.object(tool, "_rename_noreplace_between", side_effect=race_after_rollback_verify):
+                with self.assertRaisesRegex(tool.WorkspaceError, "rollback incomplete; preserve"):
+                    tool.generate_indexes(self.root)
+        victim_relative = installed[-1]["relative"]
+        self.assertEqual(generated_paths[victim_relative].read_bytes(), user_bytes)
+        for entry in installed[:-1]:
+            self.assertFalse(generated_paths[entry["relative"]].exists())
+        transactions = list((self.root / ".workspace-organizer" / "cache").glob("index-*"))
+        self.assertEqual(len(transactions), 1)
+        self.assertTrue((transactions[0] / "manifest.json").is_file())
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are required")
     def test_index_parent_symlink_race_never_writes_outside(self):
         bundle = self.root / "20_任务" / "sample-task"

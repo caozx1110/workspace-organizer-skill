@@ -3177,6 +3177,31 @@ def _rollback_index_transaction(
     entries: Sequence[MutableMapping[str, Any]],
     transaction_fd: int,
 ) -> List[str]:
+    def validate_displaced_candidate(entry: Mapping[str, Any]) -> None:
+        content, info, snapshot = _read_regular_entry_at(
+            transaction_fd, entry["stage_name"], entry["relative"]
+        )
+        if (
+            not _same_identity(info, entry["stage_info"])
+            or content != entry["new_bytes"]
+            or not _same_snapshot(snapshot, entry["new_snapshot"])
+        ):
+            raise _error(
+                entry["relative"],
+                "rollback atomically displaced concurrent user content instead of the installed candidate",
+            )
+
+    def restore_unexpected_displaced(entry: Mapping[str, Any]) -> None:
+        parent_fd = entry["parent_fd"]
+        if entry["prior_exists"]:
+            _exchange_entries_at(
+                transaction_fd, entry["stage_name"], parent_fd, entry["name"]
+            )
+        else:
+            _rename_noreplace_between(
+                transaction_fd, entry["stage_name"], parent_fd, entry["name"]
+            )
+
     failures: List[str] = []
     for entry in reversed(entries):
         if not entry["installed"]:
@@ -3200,8 +3225,14 @@ def _rollback_index_transaction(
                     transaction_fd, entry["stage_name"], parent_fd, entry["name"]
                 )
             else:
-                os.unlink(entry["name"], dir_fd=parent_fd)
-                os.fsync(parent_fd)
+                _rename_noreplace_between(
+                    parent_fd, entry["name"], transaction_fd, entry["stage_name"]
+                )
+            try:
+                validate_displaced_candidate(entry)
+            except BaseException:
+                restore_unexpected_displaced(entry)
+                raise
             entry["installed"] = False
             entry["expected_exists"] = entry["prior_exists"]
             entry["expected_bytes"] = entry["prior_bytes"]
