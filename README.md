@@ -14,6 +14,7 @@ by default.
 - [中文安装与使用指南](docs/guide.zh-CN.md)
 - [Normative v1 workspace model](docs/workspace-model.md)
 - [Auditable distribution-readiness checklist](docs/distribution-readiness.md)
+- [Optional read-only dashboard contract](skill/workspace-organizer/references/dashboard.md)
 - [Official OpenAI skill documentation](https://learn.chatgpt.com/docs/build-skills)
 
 Prerequisite: Python 3.9 or later on a supported POSIX filesystem. Run the
@@ -24,5 +25,6 @@ python3 scripts/run_release_gate.py
 ```
 
 This repository does not tag, publish, or release anything as part of the gate.
-The v1 skill is fully usable without a dashboard; Issue #7 owns a later
-read-only dashboard that consumes the same sensitivity-filtered generated data.
+The v1 skill remains fully usable without dashboard assets. The optional v2
+dashboard is a deterministic, read-only local projection over the same
+sensitivity-filtered generated data; it never becomes task authority.

@@ -27,10 +27,14 @@ class SkillPackageTests(unittest.TestCase):
             "references/initialization-and-adoption.md",
             "references/task-contract.md",
             "references/views-and-archive.md",
+            "references/dashboard.md",
             "references/tooling.md",
             "scripts/workspace_organizer.py",
+            "scripts/workspace_dashboard.py",
             "assets/workspace-config.json",
             "assets/TASK.md",
+            "assets/dashboard/styles.css",
+            "assets/dashboard/app.js",
             "assets/empty-generated-views/todo.json",
             "assets/empty-generated-views/timeline.json",
             "assets/empty-generated-views/materials.json",
@@ -45,6 +49,7 @@ class SkillPackageTests(unittest.TestCase):
         }
         self.assertEqual(actual, expected)
         self.assertTrue((SKILL_ROOT / "scripts" / "workspace_organizer.py").is_file())
+        self.assertTrue((SKILL_ROOT / "scripts" / "workspace_dashboard.py").is_file())
 
     def test_skill_metadata_and_progressive_disclosure(self) -> None:
         text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -52,13 +57,14 @@ class SkillPackageTests(unittest.TestCase):
         front_matter = text.split("---", 2)[1]
         self.assertRegex(front_matter, r"(?m)^name: workspace-organizer$")
         description = re.search(r"(?m)^description: (.+)$", front_matter).group(1).lower()
-        for trigger in ("initialize", "adopt", "TASK.md", "archive"):
+        for trigger in ("initialize", "adopt", "TASK.md", "dashboard", "archive"):
             self.assertIn(trigger.lower(), description)
 
         for reference in (
             "references/initialization-and-adoption.md",
             "references/task-contract.md",
             "references/views-and-archive.md",
+            "references/dashboard.md",
             "references/tooling.md",
         ):
             self.assertIn(reference, text)

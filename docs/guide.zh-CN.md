@@ -39,6 +39,7 @@ export WO_CONSUMER_REPO="/absolute/path/to/consumer-repository"
 export WO_ROOT="/absolute/path/to/workspace"
 export WO_PLAN_ROOT="/absolute/path/to/private-plan-directory"
 export WO_TOOL="$WO_CONSUMER_REPO/.agents/skills/workspace-organizer/scripts/workspace_organizer.py"
+export WO_DASHBOARD="$WO_CONSUMER_REPO/.agents/skills/workspace-organizer/scripts/workspace_dashboard.py"
 ```
 
 <!-- coverage:installation -->
@@ -180,6 +181,31 @@ python3 "$WO_TOOL" verify "$WO_ROOT" --plan "$WO_PLAN_ROOT/archive.json"
 
 验证通过的归档会更新规范记录，并且只移动整个任务包一次；绝不覆盖已有目标。
 
+<!-- coverage:dashboard -->
+## 生成可选的只读看板
+
+本地 v2 看板是可丢弃的派生投影，不是第二数据源。先重新生成稳定的 v1 catalog，
+再生成并验证 `.workspace-organizer/dashboard/` 下的四份静态文件：
+
+```sh
+python3 "$WO_TOOL" index "$WO_ROOT"
+python3 "$WO_DASHBOARD" generate "$WO_ROOT"
+python3 "$WO_DASHBOARD" verify "$WO_ROOT"
+```
+
+生成器会先从规范配置和 `TASK.md` 独立重建预期 TODO 与时间线 catalog，再要求磁盘上的
+v1 catalog 与其逐字节相同。过期、伪造、格式错误、未知或敏感输入都会在渲染、计数、
+分组或看板哈希前安全失败。每个展示项都是经过安全转义、指向规范 `TASK.md` 的相对链接；
+不会复制任务正文或文件内容。
+
+HTML 完全静态，在限制严格的 CSP 下使用软件包内 CSS 和 JavaScript。控件只能切换
+TODO/时间线和筛选所显示的优先级；不存在表单、可编辑字段、网络请求、数据库、
+service worker、遥测、批准控件、归档控件或操作端点。页面展示确定性的来源指纹，
+不使用墙上时钟时间；运行 `verify` 可判断快照是否过期。
+
+看板文件是可选的。即使它们缺失或被移除，仍可照常用 v1 CLI 完成初始化、接纳、索引、
+批准、执行、验证和归档。
+
 <!-- coverage:rollback -->
 ## 回滚与失败预期
 
@@ -199,8 +225,8 @@ v1 记录不可变意图、预写阶段、前后哈希、旧任务字节和配�
 - 清单不会跟随符号链接或进入嵌套 Git 仓库。压缩原件默认只读元数据；只有另行确认的
   有界列表才会打开，工具永不解压。
 - 扫描大文件时可以延迟哈希；生成材料 catalog 时仍只对符合可见条件的材料做内容哈希。
-- v1 没有 HTML 看板，初始化、接纳、更新任务、生成视图和归档都不需要看板。Issue #7
-  负责后续只读静态消费者，它读取同一份规范且按敏感度过滤的数据，不能变成可编辑或权威数据源。
+- 可选 HTML 看板只是规范、按敏感度过滤数据的只读静态消费者。初始化、接纳、更新任务、
+  生成视图和归档都不依赖其任何文件。
 
 <!-- coverage:validation -->
 ## 验证分发就绪状态

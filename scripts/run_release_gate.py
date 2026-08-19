@@ -84,6 +84,10 @@ def run_gate(repo_root: Path, skill_creator_root: Optional[Path]) -> dict:
                 [python, "-m", "unittest", "-v", "tests/test_distribution_readiness.py"],
             ),
             (
+                "dashboard-v2-tests",
+                [python, "-m", "unittest", "-v", "tests/test_dashboard.py"],
+            ),
+            (
                 "full-repository-tests",
                 [python, "-m", "unittest", "discover", "-s", "tests", "-v"],
             ),

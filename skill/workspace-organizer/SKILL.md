@@ -1,6 +1,6 @@
 ---
 name: workspace-organizer
-description: Initialize and safely organize durable filesystem workspaces for tasks, materials, local TODOs, timelines, and archives. Use when Codex is asked to create a managed workspace, adopt existing folders in place, create or update canonical TASK.md records, classify workspace materials, regenerate workspace-organizer views, or archive closed tasks. Apply the v1 contract without silently moving, overwriting, deleting, publishing, or exposing sensitive content.
+description: Initialize and safely organize durable filesystem workspaces for tasks, materials, local TODOs, timelines, static dashboards, and archives. Use when Codex is asked to create a managed workspace, adopt existing folders in place, create or update canonical TASK.md records, classify workspace materials, regenerate workspace-organizer views, generate the optional read-only dashboard, or archive closed tasks. Apply the v1 contract without silently moving, overwriting, deleting, publishing, or exposing sensitive content.
 ---
 
 # Workspace Organizer
@@ -23,6 +23,8 @@ making every structural change reviewable.
      or changing a task, status, metadata, or sensitivity.
    - Read [references/views-and-archive.md](references/views-and-archive.md) before
      indexing, regenerating views, checking archive eligibility, or archiving.
+   - Read [references/dashboard.md](references/dashboard.md) before generating or
+     verifying the optional read-only static dashboard.
    - Read [references/tooling.md](references/tooling.md) before invoking the
      deterministic CLI or integrating its Python API.
 
@@ -71,6 +73,15 @@ and a non-executable proposal. State that apply, verification, index generation,
 and archive are unavailable; do not approximate them. Treat
 [`assets/empty-generated-views/`](assets/empty-generated-views/) as contract
 fixtures for tooling, never as files to copy directly into a live workspace.
+
+### Generate or verify the optional dashboard
+
+Follow `references/dashboard.md` and delegate dashboard generation and freshness
+checks to [`scripts/workspace_dashboard.py`](scripts/workspace_dashboard.py).
+Generate the v1 indexes first. Treat `.workspace-organizer/dashboard/` as a
+disposable derived location: its controls only filter or navigate locally, and
+its absence never blocks a v1 operation. Never use dashboard HTML or its
+manifest as task truth.
 
 ## Finish safely
 
