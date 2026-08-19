@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import importlib.util
 import json
@@ -104,6 +105,270 @@ def generated_bytes(root: Path) -> Dict[str, bytes]:
         for pair in tool.GENERATED_PATHS.values()
         for relative in pair
     }
+
+
+EXPECTED_SCENARIO_TESTS = (
+    "test_seven_families_share_one_schema_and_lifecycle",
+    "test_empty_initialization_full_pipeline_and_difficult_files",
+    "test_adopt_in_place_preserves_existing_content_and_archives_once",
+    "test_stale_and_collision_cases_leave_manifest_unchanged",
+    "test_index_failure_rolls_back_all_six_outputs",
+    "test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete",
+)
+EXPECTED_REQUIREMENT_SOURCES = {
+    "issue_acceptance": "https://github.com/caozx1110/workspace-organizer-skill/issues/5",
+    "epic_success_criteria": "https://github.com/caozx1110/workspace-organizer-skill/issues/1",
+    "epic_definition_of_done": "https://github.com/caozx1110/workspace-organizer-skill/issues/1",
+}
+EXPECTED_GATE_REGISTRY = {
+    "gate:skill-quick-validator": [
+        "python3",
+        "{skill_creator_root}/scripts/quick_validate.py",
+        "skill/workspace-organizer",
+    ],
+    "gate:repository-tests": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v",
+    ],
+}
+EXPECTED_REQUIREMENTS = {
+    "issue_acceptance": {
+        "ISSUE-5-AC-01": (
+            "All seven representative task families pass through the same task lifecycle and schema.",
+            ("test_seven_families_share_one_schema_and_lifecycle",),
+        ),
+        "ISSUE-5-AC-02": (
+            "New-workspace initialization and adopt-in-place flows are both covered end to end.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_adopt_in_place_preserves_existing_content_and_archives_once",
+            ),
+        ),
+        "ISSUE-5-AC-03": (
+            "Unicode paths, spaces, large binary placeholders, compressed files, duplicates, temporary files, nested Git repositories, and sensitive materials have explicit expected behavior.",
+            ("test_empty_initialization_full_pipeline_and_difficult_files",),
+        ),
+        "ISSUE-5-AC-04": (
+            "Dry-run, approval, apply, verification, deterministic indexes, archive, and rollback evidence are exercised.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_adopt_in_place_preserves_existing_content_and_archives_once",
+                "test_index_failure_rolls_back_all_six_outputs",
+            ),
+        ),
+        "ISSUE-5-AC-05": (
+            "Tests assert absence of unapproved deletion, overwrite, movement, publication, and sensitive-data exposure.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_adopt_in_place_preserves_existing_content_and_archives_once",
+                "test_stale_and_collision_cases_leave_manifest_unchanged",
+            ),
+        ),
+        "ISSUE-5-AC-06": (
+            "Repeated runs produce equivalent plans and generated views for unchanged inputs.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_adopt_in_place_preserves_existing_content_and_archives_once",
+            ),
+        ),
+        "ISSUE-5-AC-07": (
+            "Every global success criterion in Epic #1 maps to at least one repeatable scenario or focused test.",
+            ("test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete",),
+        ),
+        "ISSUE-5-AC-08": (
+            "Fixtures contain no private paths, credentials, personal records, or proprietary datasets.",
+            ("test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete",),
+        ),
+    },
+    "epic_success_criteria": {
+        "EPIC-SC-01": (
+            "A new workspace can be initialized with a predictable human-readable structure and machine-readable control data.",
+            ("test_empty_initialization_full_pipeline_and_difficult_files",),
+        ),
+        "EPIC-SC-02": (
+            "Every task has a stable ASCII identifier and one canonical `TASK.md`; TODO, timeline, and material indexes are generated deterministically from task records.",
+            (
+                "test_seven_families_share_one_schema_and_lifecycle",
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+            ),
+        ),
+        "EPIC-SC-03": (
+            "Research, paper review, reimbursement, presentation, competition, external collaboration, and contract scenarios fit the same lifecycle model through labels and optional templates.",
+            ("test_seven_families_share_one_schema_and_lifecycle",),
+        ),
+        "EPIC-SC-04": (
+            "File classification and migration run as scan -> proposal -> dry-run -> explicit approval -> apply -> verify, with no automatic overwrite or deletion.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_stale_and_collision_cases_leave_manifest_unchanged",
+            ),
+        ),
+        "EPIC-SC-05": (
+            "Completed work archives once under `90_归档/YYYY/<area>/<task-id>/`, while ambiguous, duplicate, temporary, and compressed materials remain isolated for confirmation.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_adopt_in_place_preserves_existing_content_and_archives_once",
+            ),
+        ),
+        "EPIC-SC-06": (
+            "A later static HTML dashboard can render TODO and timeline views from the same source data without becoming a second source of truth.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "tests.test_workspace_model.WorkspaceModelContractTests.test_generated_catalogs_match_normative_projection",
+            ),
+        ),
+    },
+    "epic_definition_of_done": {
+        "EPIC-DOD-01": (
+            "The skill passes the `skill-creator` structural validator and all repository tests.",
+            ("gate:skill-quick-validator", "gate:repository-tests"),
+        ),
+        "EPIC-DOD-02": (
+            "Initialization, adoption, task updates, generated views, archival, and rollback behavior are documented and tested.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_adopt_in_place_preserves_existing_content_and_archives_once",
+                "test_index_failure_rolls_back_all_six_outputs",
+            ),
+        ),
+        "EPIC-DOD-03": (
+            "Generated indexes are deterministic and can locate the canonical task and material roles without scanning every binary on each request.",
+            ("test_empty_initialization_full_pipeline_and_difficult_files",),
+        ),
+        "EPIC-DOD-04": (
+            "Destructive behavior is absent by default; move operations require approved plans and produce verification evidence.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "test_stale_and_collision_cases_leave_manifest_unchanged",
+            ),
+        ),
+        "EPIC-DOD-05": (
+            "Representative task families work without introducing task-specific lifecycle forks.",
+            ("test_seven_families_share_one_schema_and_lifecycle",),
+        ),
+        "EPIC-DOD-06": (
+            "Public examples and test fixtures contain no private paths, proprietary data, credentials, or personal documents.",
+            ("test_public_fixtures_and_requirement_matrix_are_hygienic_and_complete",),
+        ),
+        "EPIC-DOD-07": (
+            "v1 is usable without the HTML dashboard; the v2 dashboard reads the same canonical data and excludes sensitive content by default.",
+            (
+                "test_empty_initialization_full_pipeline_and_difficult_files",
+                "tests.test_workspace_model.WorkspaceModelContractTests.test_sensitive_tasks_and_materials_do_not_affect_default_views",
+            ),
+        ),
+    },
+}
+
+
+def _flatten_tests(suite: unittest.TestSuite) -> list[unittest.TestCase]:
+    cases = []
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            cases.extend(_flatten_tests(item))
+        else:
+            cases.append(item)
+    return cases
+
+
+def _reference_resolves_once(reference: str) -> bool:
+    try:
+        suite = unittest.defaultTestLoader.loadTestsFromName(reference)
+        cases = _flatten_tests(suite)
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return False
+    return (
+        len(cases) == 1
+        and isinstance(cases[0], unittest.TestCase)
+        and cases[0].__class__.__name__ != "_FailedTest"
+        and cases[0].id() == reference
+    )
+
+
+def validate_requirement_matrix(
+    matrix: Mapping[str, Any],
+    scenario_case: type[unittest.TestCase],
+) -> list[str]:
+    errors = []
+    expected_keys = {
+        "schema_version",
+        "suite",
+        "sources",
+        "gate_registry",
+        "tests",
+        *EXPECTED_REQUIREMENTS,
+    }
+    if set(matrix) != expected_keys:
+        errors.append("top-level matrix keys do not match the reviewed schema")
+    if matrix.get("schema_version") != 1:
+        errors.append("matrix schema_version must be 1")
+    if matrix.get("suite") != "workspace-organizer-scenarios":
+        errors.append("matrix suite identity changed")
+    if matrix.get("sources") != EXPECTED_REQUIREMENT_SOURCES:
+        errors.append("Issue/Epic source URL registry changed")
+    if matrix.get("gate_registry") != EXPECTED_GATE_REGISTRY:
+        errors.append("delivery gate registry changed or contains an unknown gate")
+
+    declared_tests = matrix.get("tests")
+    if declared_tests != list(EXPECTED_SCENARIO_TESTS):
+        errors.append("scenario test registry changed")
+    actual_tests = {
+        name for name in dir(scenario_case) if name.startswith("test_")
+    }
+    if actual_tests != set(EXPECTED_SCENARIO_TESTS):
+        errors.append("ScenarioValidationTests methods do not match the reviewed registry")
+    for reference in EXPECTED_SCENARIO_TESTS:
+        qualified = f"{scenario_case.__module__}.{scenario_case.__qualname__}.{reference}"
+        if not callable(getattr(scenario_case, reference, None)):
+            errors.append(f"local test reference is not callable: {reference}")
+        elif not _reference_resolves_once(qualified):
+            errors.append(f"local test reference does not resolve exactly once: {reference}")
+
+    for group, expected_rows in EXPECTED_REQUIREMENTS.items():
+        rows = matrix.get(group)
+        if not isinstance(rows, list):
+            errors.append(f"{group} must be a list")
+            continue
+        actual_ids = [row.get("id") for row in rows if isinstance(row, dict)]
+        if len(actual_ids) != len(rows) or len(set(actual_ids)) != len(actual_ids):
+            errors.append(f"{group} contains an invalid or duplicate ID")
+        if set(actual_ids) != set(expected_rows):
+            errors.append(f"{group} IDs do not match the reviewed snapshot")
+        by_id = {
+            row["id"]: row
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        }
+        for requirement_id, (criterion, coverage) in expected_rows.items():
+            row = by_id.get(requirement_id)
+            if row is None:
+                continue
+            if set(row) != {"id", "criterion", "coverage"}:
+                errors.append(f"{requirement_id} fields changed")
+            if row.get("criterion") != criterion:
+                errors.append(f"{requirement_id} criterion differs from the tracked source text")
+            if row.get("coverage") != list(coverage):
+                errors.append(f"{requirement_id} coverage differs from the reviewed mapping")
+            for reference in row.get("coverage", []):
+                if reference in EXPECTED_SCENARIO_TESTS:
+                    if reference not in (declared_tests or []):
+                        errors.append(f"undeclared local test reference: {reference}")
+                elif isinstance(reference, str) and reference.startswith("tests."):
+                    if not _reference_resolves_once(reference):
+                        errors.append(
+                            f"dotted test reference does not resolve exactly one real test: {reference}"
+                        )
+                elif isinstance(reference, str) and reference.startswith("gate:"):
+                    if reference not in EXPECTED_GATE_REGISTRY:
+                        errors.append(f"unknown delivery gate reference: {reference}")
+                else:
+                    errors.append(f"unknown coverage reference: {reference!r}")
+    return errors
 
 
 class ScenarioValidationTests(unittest.TestCase):
@@ -707,34 +972,42 @@ class ScenarioValidationTests(unittest.TestCase):
             8 * 1024,
             "large-file behavior must use a generated compact placeholder",
         )
-        test_ids = set(self.matrix["tests"])
-        self.assertEqual(
-            test_ids,
-            {
-                name
-                for name in dir(self.__class__)
-                if name.startswith("test_")
-            },
+        self.assertEqual(validate_requirement_matrix(self.matrix, self.__class__), [])
+
+        mutations = {}
+        nonexistent_dotted = copy.deepcopy(self.matrix)
+        nonexistent_dotted["epic_success_criteria"][-1]["coverage"][-1] = (
+            "tests.test_workspace_model.WorkspaceModelContractTests.test_missing_scenario"
         )
-        groups = {
-            "issue_acceptance": 8,
-            "epic_success_criteria": 6,
-            "epic_definition_of_done": 7,
-        }
-        for group, expected_count in groups.items():
-            rows = self.matrix[group]
-            self.assertEqual(len(rows), expected_count, group)
-            self.assertEqual(len({row["id"] for row in rows}), expected_count, group)
-            for row in rows:
-                self.assertTrue(row["criterion"].strip(), row["id"])
-                self.assertTrue(row["coverage"], row["id"])
-                for reference in row["coverage"]:
-                    self.assertTrue(
-                        reference in test_ids
-                        or reference.startswith("tests.")
-                        or reference.startswith("gate:"),
-                        f"unknown coverage reference {reference!r}",
-                    )
+        mutations["nonexistent dotted test"] = (
+            nonexistent_dotted,
+            "dotted test reference does not resolve exactly one real test",
+        )
+        unknown_gate = copy.deepcopy(self.matrix)
+        unknown_gate["epic_definition_of_done"][0]["coverage"][0] = "gate:unknown"
+        mutations["unknown gate"] = (
+            unknown_gate,
+            "unknown delivery gate reference",
+        )
+        wrong_id = copy.deepcopy(self.matrix)
+        wrong_id["issue_acceptance"][0]["id"] = "ISSUE-5-AC-99"
+        mutations["wrong requirement ID"] = (
+            wrong_id,
+            "IDs do not match the reviewed snapshot",
+        )
+        changed_criterion = copy.deepcopy(self.matrix)
+        changed_criterion["epic_definition_of_done"][-1]["criterion"] += " Changed."
+        mutations["changed criterion text"] = (
+            changed_criterion,
+            "criterion differs from the tracked source text",
+        )
+        for name, (mutated, expected_error) in mutations.items():
+            with self.subTest(rejected_mutation=name):
+                errors = validate_requirement_matrix(mutated, self.__class__)
+                self.assertTrue(
+                    any(expected_error in error for error in errors),
+                    errors,
+                )
 
 
 if __name__ == "__main__":

@@ -55,8 +55,9 @@ rewriting existing files. A later approved archive moves the adopted task once,
 updates only its exact registration, and preserves rollback inputs in immutable
 verification evidence.
 
-The requirement JSON maps all eight Issue #5 acceptance items, all six Epic
-success criteria, and all seven Epic definition-of-done items to repeatable
-tests or final validation gates. Dashboard coverage here is limited to the
-stable sensitivity-filtered generated-view interface; HTML implementation stays
-owned by Issue #7.
+The requirement JSON preserves the exact reviewed Issue/Epic criterion text and
+source URLs. Its validator enforces all eight Issue #5 acceptance IDs, all six
+Epic success IDs, all seven Epic definition-of-done IDs, their reviewed coverage
+mapping, real unittest targets, and an exact delivery-gate command registry.
+Dashboard coverage here is limited to the stable sensitivity-filtered
+generated-view interface; HTML implementation stays owned by Issue #7.
