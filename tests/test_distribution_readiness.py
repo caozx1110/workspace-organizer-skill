@@ -72,6 +72,12 @@ class DistributionReadinessTests(unittest.TestCase):
         ]
         self.assertEqual(unexpected_packages, [])
 
+    def installer_quarantines(self, consumer: Path) -> list[Path]:
+        agents = consumer / ".agents"
+        if not agents.exists():
+            return []
+        return sorted(agents.glob(".workspace-organizer.install-*"))
+
     def test_bilingual_guides_have_equivalent_auditable_coverage(self) -> None:
         for coverage_id in COVERAGE_IDS:
             marker = f"<!-- coverage:{coverage_id} -->"
@@ -103,6 +109,8 @@ class DistributionReadinessTests(unittest.TestCase):
         self.assertIn("任务 ID 是稳定的小写 ASCII slug。", self.chinese)
         for guide in (self.english, self.chinese):
             self.assertIn("installed-with-durability-warning", guide)
+        self.assertIn("quarantined outside", self.english)
+        self.assertIn("非扫描位置隔离", self.chinese)
 
     def test_documented_validation_commands_and_prerequisites_are_exact(self) -> None:
         commands = (
@@ -269,7 +277,10 @@ class DistributionReadinessTests(unittest.TestCase):
                 if stage == "staging-complete":
                     raise RuntimeError("injected before publish")
 
-            with self.assertRaisesRegex(RuntimeError, "injected before publish"):
+            with self.assertRaisesRegex(
+                installer.InstallError,
+                "injected before publish.*quarantined outside",
+            ):
                 installer.install_skill(
                     source,
                     interrupted,
@@ -280,6 +291,7 @@ class DistributionReadinessTests(unittest.TestCase):
                 (interrupted / ".agents" / "skills" / "workspace-organizer").exists()
             )
             self.assert_no_installer_artifacts(interrupted)
+            self.assertEqual(len(self.installer_quarantines(interrupted)), 1)
 
             collided = base / "collided"
             collided.mkdir()
@@ -303,8 +315,9 @@ class DistributionReadinessTests(unittest.TestCase):
                 user_bytes,
             )
             self.assert_no_installer_artifacts(collided)
+            self.assertEqual(len(self.installer_quarantines(collided)), 1)
 
-    def test_installer_cleans_mid_copy_and_base_exception_staging(self) -> None:
+    def test_installer_quarantines_mid_copy_and_base_exception_staging(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             source = REPO_ROOT / "skill" / "workspace-organizer"
@@ -315,7 +328,10 @@ class DistributionReadinessTests(unittest.TestCase):
                 if stage == "source-entry-statted:references/tooling.md":
                     raise RuntimeError("injected mid-copy failure")
 
-            with self.assertRaisesRegex(RuntimeError, "injected mid-copy failure"):
+            with self.assertRaisesRegex(
+                installer.InstallError,
+                "injected mid-copy failure.*quarantined outside",
+            ):
                 installer.install_skill(
                     source,
                     mid_copy,
@@ -326,6 +342,19 @@ class DistributionReadinessTests(unittest.TestCase):
             self.assertFalse(
                 (mid_copy / ".agents" / "skills" / "workspace-organizer").exists()
             )
+            self.assertEqual(len(self.installer_quarantines(mid_copy)), 1)
+            retry = installer.install_skill(source, mid_copy, confirmed=True)
+            self.assertEqual(retry["status"], "installed")
+            self.assertTrue(
+                (
+                    mid_copy
+                    / ".agents"
+                    / "skills"
+                    / "workspace-organizer"
+                    / "SKILL.md"
+                ).is_file()
+            )
+            self.assertEqual(len(self.installer_quarantines(mid_copy)), 1)
 
             interrupted = base / "base-exception"
             interrupted.mkdir()
@@ -334,7 +363,10 @@ class DistributionReadinessTests(unittest.TestCase):
                 if stage == "staging-complete":
                     raise KeyboardInterrupt()
 
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "quarantined outside",
+            ):
                 installer.install_skill(
                     source,
                     interrupted,
@@ -344,6 +376,97 @@ class DistributionReadinessTests(unittest.TestCase):
             self.assert_no_installer_artifacts(interrupted)
             self.assertFalse(
                 (interrupted / ".agents" / "skills" / "workspace-organizer").exists()
+            )
+            self.assertEqual(len(self.installer_quarantines(interrupted)), 1)
+
+    def test_installer_never_unlinks_same_name_user_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = Path(temporary) / "consumer"
+            consumer.mkdir()
+            user_bytes = b"user replacement must survive\n"
+
+            def replace_staged_file(stage: str) -> None:
+                if stage != "staging-complete":
+                    return
+                quarantine = self.installer_quarantines(consumer)
+                self.assertEqual(len(quarantine), 1)
+                staged_skill = quarantine[0] / "SKILL.md"
+                staged_skill.rename(quarantine[0] / "SKILL.operation-owned")
+                staged_skill.write_bytes(user_bytes)
+                raise RuntimeError("injected after same-name replacement")
+
+            with mock.patch.object(
+                installer.os,
+                "unlink",
+                side_effect=AssertionError("installer must not unlink"),
+            ), mock.patch.object(
+                installer.os,
+                "rmdir",
+                side_effect=AssertionError("installer must not rmdir"),
+            ):
+                with self.assertRaisesRegex(
+                    installer.InstallError,
+                    "same-name replacement.*quarantined outside",
+                ):
+                    installer.install_skill(
+                        REPO_ROOT / "skill" / "workspace-organizer",
+                        consumer,
+                        confirmed=True,
+                        _test_hook=replace_staged_file,
+                    )
+            quarantine = self.installer_quarantines(consumer)
+            self.assertEqual(len(quarantine), 1)
+            self.assertEqual((quarantine[0] / "SKILL.md").read_bytes(), user_bytes)
+            self.assertTrue((quarantine[0] / "SKILL.operation-owned").is_file())
+            self.assert_no_installer_artifacts(consumer)
+            self.assertFalse(
+                (consumer / ".agents" / "skills" / "workspace-organizer").exists()
+            )
+
+    def test_installer_never_deletes_directory_swapped_after_mkdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            consumer = base / "consumer"
+            consumer.mkdir()
+            replacement = base / "user-directory"
+            replacement.mkdir()
+            user_bytes = b"user directory bytes must survive\n"
+            replacement.joinpath("keep.txt").write_bytes(user_bytes)
+
+            def replace_created_root(stage: str) -> None:
+                if stage != "staging-root-created":
+                    return
+                quarantine = self.installer_quarantines(consumer)
+                self.assertEqual(len(quarantine), 1)
+                quarantine[0].rename(consumer / ".agents" / "operation-created-root")
+                replacement.rename(quarantine[0])
+
+            with mock.patch.object(
+                installer.os,
+                "unlink",
+                side_effect=AssertionError("installer must not unlink"),
+            ), mock.patch.object(
+                installer.os,
+                "rmdir",
+                side_effect=AssertionError("installer must not rmdir"),
+            ):
+                with self.assertRaisesRegex(
+                    installer.InstallError,
+                    "staged directory contents changed.*quarantined outside",
+                ):
+                    installer.install_skill(
+                        REPO_ROOT / "skill" / "workspace-organizer",
+                        consumer,
+                        confirmed=True,
+                        _test_hook=replace_created_root,
+                    )
+            quarantine = self.installer_quarantines(consumer)
+            self.assertEqual(len(quarantine), 1)
+            self.assertEqual((quarantine[0] / "keep.txt").read_bytes(), user_bytes)
+            self.assertTrue((consumer / ".agents" / "operation-created-root").is_dir())
+            self.assert_no_installer_artifacts(consumer)
+            self.assertFalse(
+                (consumer / ".agents" / "skills" / "workspace-organizer").exists()
             )
 
     def test_installer_reconciles_post_rename_parent_fsync_failure_as_success(self) -> None:
@@ -381,6 +504,51 @@ class DistributionReadinessTests(unittest.TestCase):
             self.assert_no_installer_artifacts(consumer)
             with self.assertRaisesRegex(installer.InstallError, "refusing to overwrite"):
                 installer.install_skill(source, consumer, confirmed=True)
+
+    def test_installer_moves_changed_post_publish_entry_out_of_skill_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = Path(temporary) / "consumer"
+            consumer.mkdir()
+            user_bytes = b"post-publish user replacement must survive\n"
+
+            def replace_published_entry(stage: str) -> None:
+                if stage != "published":
+                    return
+                agents = consumer / ".agents"
+                canonical = agents / "skills" / "workspace-organizer"
+                canonical.rename(agents / "operation-published-root")
+                canonical.mkdir()
+                canonical.joinpath("keep.txt").write_bytes(user_bytes)
+
+            with mock.patch.object(
+                installer.os,
+                "unlink",
+                side_effect=AssertionError("installer must not unlink"),
+            ), mock.patch.object(
+                installer.os,
+                "rmdir",
+                side_effect=AssertionError("installer must not rmdir"),
+            ):
+                with self.assertRaisesRegex(
+                    installer.InstallError,
+                    "publish state is unknown.*no content was deleted",
+                ):
+                    installer.install_skill(
+                        REPO_ROOT / "skill" / "workspace-organizer",
+                        consumer,
+                        confirmed=True,
+                        _test_hook=replace_published_entry,
+                    )
+            quarantines = self.installer_quarantines(consumer)
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual((quarantines[0] / "keep.txt").read_bytes(), user_bytes)
+            self.assertTrue(
+                (consumer / ".agents" / "operation-published-root" / "SKILL.md").is_file()
+            )
+            self.assert_no_installer_artifacts(consumer)
+            self.assertFalse(
+                (consumer / ".agents" / "skills" / "workspace-organizer").exists()
+            )
 
     def test_public_docs_examples_skill_and_fixtures_are_safe_and_linked(self) -> None:
         self.assertEqual(public_check.validate_public_content(REPO_ROOT), [])

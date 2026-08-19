@@ -60,8 +60,16 @@ The installer creates
 `$WO_CONSUMER_REPO/.agents/skills/workspace-organizer` and refuses an existing
 destination or a symlinked package. It never updates, replaces, or removes an
 installed skill. Source and target traversal is descriptor-anchored and
-no-follow; a complete staged copy is published with one atomic no-replace
-rename. A race or partial failure exposes no final destination. Codex scans
+no-follow. A random mode-`0700` staging directory is created directly under
+`.agents`, outside the scanned `.agents/skills` directory; a complete verified
+copy is published across those directories with one atomic no-replace rename.
+A race or partial failure exposes no final destination. The installer never
+recursively deletes staging: failed evidence remains quarantined outside the
+skill scan at `.agents/.workspace-organizer.install-<random>`. Inspect that
+directory manually before removing it; a retry uses a new random name. If a
+post-rename identity or parent check fails, the current canonical entry is
+atomically moved back to that non-scanned quarantine without deletion; an
+unreconcilable move is reported as an unknown publish state. Codex scans
 repository `.agents/skills` locations as described by the
 [official OpenAI skill documentation](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills).
 Restart Codex only if a newly installed skill does not appear.
