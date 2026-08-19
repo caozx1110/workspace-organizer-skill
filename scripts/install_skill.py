@@ -33,6 +33,7 @@ _WRITE_NEW_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
 )
 _Identity = Tuple[int, int, int]
+_OwnedManifest = Dict[str, _Identity]
 _TestHook = Optional[Callable[[str], None]]
 
 
@@ -152,6 +153,7 @@ def _copy_regular_file(
     name: str,
     relative: str,
     before: os.stat_result,
+    owned: _OwnedManifest,
     test_hook: _TestHook,
 ) -> None:
     if test_hook is not None:
@@ -171,6 +173,10 @@ def _copy_regular_file(
             stat.S_IMODE(opened.st_mode) & 0o777,
             dir_fd=destination_parent_fd,
         )
+        created = os.fstat(destination_fd)
+        if not stat.S_ISREG(created.st_mode):
+            raise InstallError(f"staged entry is not a regular file: {relative}")
+        owned[relative] = _identity(created)
         while True:
             payload = os.read(source_fd, 1024 * 1024)
             if not payload:
@@ -191,6 +197,7 @@ def _copy_directory_tree(
     source_fd: int,
     destination_fd: int,
     relative_parent: str,
+    owned: _OwnedManifest,
     test_hook: _TestHook,
 ) -> None:
     initial_names = sorted(name for name in os.listdir(source_fd) if not _ignored(name))
@@ -215,16 +222,34 @@ def _copy_directory_tree(
                 raise InstallError(f"source directory changed before copy: {relative}")
             try:
                 os.mkdir(name, mode=0o755, dir_fd=destination_fd)
+                created = os.stat(name, dir_fd=destination_fd, follow_symlinks=False)
+                owned[relative] = _identity(created)
                 child_destination_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=destination_fd)
                 try:
-                    _copy_directory_tree(child_source_fd, child_destination_fd, relative, test_hook)
+                    if _identity(os.fstat(child_destination_fd)) != owned[relative]:
+                        raise InstallError(f"staged directory changed before copy: {relative}")
+                    _copy_directory_tree(
+                        child_source_fd,
+                        child_destination_fd,
+                        relative,
+                        owned,
+                        test_hook,
+                    )
                     os.fsync(child_destination_fd)
                 finally:
                     os.close(child_destination_fd)
             finally:
                 os.close(child_source_fd)
         elif stat.S_ISREG(before.st_mode):
-            _copy_regular_file(source_fd, destination_fd, name, relative, before, test_hook)
+            _copy_regular_file(
+                source_fd,
+                destination_fd,
+                name,
+                relative,
+                before,
+                owned,
+                test_hook,
+            )
         else:
             raise InstallError(f"source contains a non-regular entry: {relative}")
     final_names = sorted(name for name in os.listdir(source_fd) if not _ignored(name))
@@ -300,24 +325,104 @@ def _rename_noreplace_at(parent_fd: int, source_name: str, destination_name: str
         raise InstallError("atomic no-replace publish failed") from OSError(
             error_number, os.strerror(error_number)
         )
-    os.fsync(parent_fd)
 
 
-def _unpublish_owned_destination(
-    skills_fd: int,
-    published_identity: _Identity,
-    quarantine_name: str,
+def _verify_owned_contents(
+    directory_fd: int,
+    relative_parent: str,
+    owned: _OwnedManifest,
 ) -> None:
+    """Verify a staged tree without following or deleting unknown entries."""
+    for name in sorted(os.listdir(directory_fd)):
+        relative = f"{relative_parent}/{name}" if relative_parent else name
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        expected = owned.get(relative)
+        if expected is None or _identity(current) != expected:
+            raise InstallError(f"staged entry is no longer operation-owned: {relative}")
+        if stat.S_ISDIR(current.st_mode):
+            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                if _identity(os.fstat(child_fd)) != expected:
+                    raise InstallError(f"staged directory changed during cleanup: {relative}")
+                _verify_owned_contents(child_fd, relative, owned)
+            finally:
+                os.close(child_fd)
+        elif not stat.S_ISREG(current.st_mode):
+            raise InstallError(f"staged entry has unsafe type during cleanup: {relative}")
+
+
+def _remove_verified_owned_contents(
+    directory_fd: int,
+    relative_parent: str,
+    owned: _OwnedManifest,
+) -> None:
+    """Remove only entries whose current inode identities match the manifest."""
+    for name in sorted(os.listdir(directory_fd)):
+        relative = f"{relative_parent}/{name}" if relative_parent else name
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        expected = owned.get(relative)
+        if expected is None or _identity(current) != expected:
+            raise InstallError(f"refusing to remove changed staged entry: {relative}")
+        if stat.S_ISDIR(current.st_mode):
+            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                if _identity(os.fstat(child_fd)) != expected:
+                    raise InstallError(f"refusing to remove changed staged directory: {relative}")
+                _remove_verified_owned_contents(child_fd, relative, owned)
+            finally:
+                os.close(child_fd)
+            final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(final) != expected:
+                raise InstallError(f"refusing to remove replaced staged directory: {relative}")
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            final = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(final) != expected:
+                raise InstallError(f"refusing to remove replaced staged file: {relative}")
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _remove_owned_tree_at(
+    parent_fd: int,
+    name: str,
+    expected: _Identity,
+    owned: _OwnedManifest,
+) -> None:
+    """Descriptor-anchored cleanup for one tree created by this operation."""
     try:
-        current = os.stat(SKILL_NAME, dir_fd=skills_fd, follow_symlinks=False)
-    except OSError:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
         return
-    if _identity(current) != published_identity:
-        return
+    if _identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+        raise InstallError("refusing to clean a staging directory whose identity changed")
+    directory_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
     try:
-        _rename_noreplace_at(skills_fd, SKILL_NAME, quarantine_name)
-    except InstallError:
-        return
+        if _identity(os.fstat(directory_fd)) != expected:
+            raise InstallError("refusing to clean a replaced staging directory")
+        _verify_owned_contents(directory_fd, "", owned)
+        _remove_verified_owned_contents(directory_fd, "", owned)
+    finally:
+        os.close(directory_fd)
+    final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _identity(final) != expected:
+        raise InstallError("refusing to remove a replaced staging directory")
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _published_install_visible(
+    target_fd: int,
+    agents_fd: int,
+    agents_identity: _Identity,
+    skills_fd: int,
+    skills_identity: _Identity,
+    published_identity: _Identity,
+) -> bool:
+    try:
+        _assert_target_chain(target_fd, agents_fd, agents_identity, skills_identity)
+        _assert_directory_at(skills_fd, SKILL_NAME, published_identity, "published skill")
+    except (InstallError, OSError):
+        return False
+    return True
 
 
 def install_skill(
@@ -329,12 +434,20 @@ def install_skill(
 ) -> Dict[str, object]:
     _require_platform_guards()
     source_lexical, source_fd, _ = _open_directory_path(source, "skill source")
-    target_lexical, target_fd, _ = _open_directory_path(
-        target_root, "target repository root"
-    )
+    try:
+        target_lexical, target_fd, _ = _open_directory_path(
+            target_root, "target repository root"
+        )
+    except BaseException:
+        os.close(source_fd)
+        raise
     agents_fd: Optional[int] = None
     skills_fd: Optional[int] = None
     staging_fd: Optional[int] = None
+    staging_name: Optional[str] = None
+    staging_identity: Optional[_Identity] = None
+    owned: _OwnedManifest = {}
+    published = False
     try:
         result: Dict[str, object] = {
             "schema_version": 1,
@@ -376,9 +489,12 @@ def install_skill(
 
         staging_name = f".{SKILL_NAME}.install-{secrets.token_hex(12)}"
         os.mkdir(staging_name, mode=0o700, dir_fd=skills_fd)
+        staging_before = os.stat(staging_name, dir_fd=skills_fd, follow_symlinks=False)
+        staging_identity = _identity(staging_before)
         staging_fd = os.open(staging_name, _DIRECTORY_FLAGS, dir_fd=skills_fd)
-        staging_identity = _identity(os.fstat(staging_fd))
-        _copy_directory_tree(source_fd, staging_fd, "", _test_hook)
+        if _identity(os.fstat(staging_fd)) != staging_identity:
+            raise InstallError("installation staging directory changed before copy")
+        _copy_directory_tree(source_fd, staging_fd, "", owned, _test_hook)
         _validate_staged_skill(staging_fd)
         os.fchmod(staging_fd, 0o755)
         os.fsync(staging_fd)
@@ -392,13 +508,69 @@ def install_skill(
             "installation staging directory",
         )
         _rename_noreplace_at(skills_fd, staging_name, SKILL_NAME)
+        published = True
         try:
-            _assert_directory_at(skills_fd, SKILL_NAME, staging_identity, "published skill")
-            _assert_target_chain(target_fd, agents_fd, agents_identity, skills_identity)
-        except InstallError:
-            _unpublish_owned_destination(skills_fd, staging_identity, f"{staging_name}.failed")
+            if not _published_install_visible(
+                target_fd,
+                agents_fd,
+                agents_identity,
+                skills_fd,
+                skills_identity,
+                staging_identity,
+            ):
+                raise InstallError("published skill is not visible through the target path")
+            if _test_hook is not None:
+                _test_hook("before-publish-fsync")
+            os.fsync(skills_fd)
+            if not _published_install_visible(
+                target_fd,
+                agents_fd,
+                agents_identity,
+                skills_fd,
+                skills_identity,
+                staging_identity,
+            ):
+                raise InstallError("published skill changed after durability sync")
+        except BaseException:
+            if _published_install_visible(
+                target_fd,
+                agents_fd,
+                agents_identity,
+                skills_fd,
+                skills_identity,
+                staging_identity,
+            ):
+                return {
+                    **result,
+                    "status": "installed-with-durability-warning",
+                    "durability": "uncertain",
+                    "warning": (
+                        "the canonical install is visible, but parent durability "
+                        "could not be confirmed"
+                    ),
+                }
+            try:
+                _remove_owned_tree_at(skills_fd, SKILL_NAME, staging_identity, owned)
+            except BaseException as cleanup_exc:
+                raise InstallError(
+                    "publish reconciliation failed and owned content could not be cleaned safely"
+                ) from cleanup_exc
             raise
         return {**result, "status": "installed"}
+    except BaseException:
+        if (
+            not published
+            and staging_name is not None
+            and staging_identity is not None
+            and skills_fd is not None
+        ):
+            try:
+                _remove_owned_tree_at(skills_fd, staging_name, staging_identity, owned)
+            except BaseException as cleanup_exc:
+                raise InstallError(
+                    "installation failed and owned staging could not be cleaned safely"
+                ) from cleanup_exc
+        raise
     finally:
         if staging_fd is not None:
             os.close(staging_fd)

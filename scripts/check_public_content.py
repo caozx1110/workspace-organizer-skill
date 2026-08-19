@@ -10,7 +10,7 @@ import re
 import stat
 import sys
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
 
@@ -38,6 +38,19 @@ PRIVATE_PATTERNS = (
     ("assigned password", re.compile(r"(?i)\bpassword\s*=\s*[^\s]+")),
     ("assigned token", re.compile(r"(?i)\btoken\s*=\s*[^\s]+")),
 )
+_FileSnapshot = Tuple[int, int, int, int, int, int]
+_TestHook = Optional[Callable[[str], None]]
+
+
+def _file_snapshot(value: os.stat_result) -> _FileSnapshot:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def public_files(repo_root: Path) -> Iterable[Path]:
@@ -63,7 +76,11 @@ def _link_target(raw: str) -> str:
     return raw.split(maxsplit=1)[0]
 
 
-def validate_public_content(repo_root: Path) -> list[str]:
+def validate_public_content(
+    repo_root: Path,
+    *,
+    _test_hook: _TestHook = None,
+) -> list[str]:
     repo_root = repo_root.resolve(strict=True)
     errors: list[str] = []
     files = list(public_files(repo_root))
@@ -89,6 +106,8 @@ def validate_public_content(repo_root: Path) -> list[str]:
                 f"{MAX_PUBLIC_FILE_BYTES}"
             )
             continue
+        if _test_hook is not None:
+            _test_hook(f"after-lstat:{relative}")
         try:
             descriptor = os.open(
                 path,
@@ -101,21 +120,53 @@ def validate_public_content(repo_root: Path) -> list[str]:
             continue
         try:
             opened = os.fstat(descriptor)
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            if _file_snapshot(opened) != _file_snapshot(before):
+                if opened.st_size > MAX_PUBLIC_FILE_BYTES:
+                    errors.append(
+                        f"{relative}: {opened.st_size} bytes exceeds public-file limit "
+                        f"{MAX_PUBLIC_FILE_BYTES}"
+                    )
+                else:
+                    errors.append(f"{relative}: public file changed before read")
+                continue
+            if not stat.S_ISREG(opened.st_mode):
                 errors.append(f"{relative}: public file changed before read")
                 continue
+            if opened.st_size > MAX_PUBLIC_FILE_BYTES:
+                errors.append(
+                    f"{relative}: {opened.st_size} bytes exceeds public-file limit "
+                    f"{MAX_PUBLIC_FILE_BYTES}"
+                )
+                continue
+            if _test_hook is not None:
+                _test_hook(f"after-open:{relative}")
             chunks = []
+            total = 0
+            exceeded_limit = False
             while True:
-                chunk = os.read(descriptor, 1024 * 1024)
+                chunk = os.read(
+                    descriptor,
+                    min(1024 * 1024, MAX_PUBLIC_FILE_BYTES + 1 - total),
+                )
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > MAX_PUBLIC_FILE_BYTES:
+                    exceeded_limit = True
+                    break
                 chunks.append(chunk)
+            if _test_hook is not None:
+                _test_hook(f"after-read:{relative}")
             after = os.fstat(descriptor)
-            if (
-                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            ):
+            if exceeded_limit:
+                errors.append(
+                    f"{relative}: content exceeds public-file limit "
+                    f"{MAX_PUBLIC_FILE_BYTES} while reading"
+                )
+            changed_during_read = _file_snapshot(opened) != _file_snapshot(after)
+            if changed_during_read:
                 errors.append(f"{relative}: public file changed during read")
+            if exceeded_limit or changed_during_read:
                 continue
             payload = b"".join(chunks)
         finally:

@@ -66,6 +66,11 @@ repository `.agents/skills` locations as described by the
 [official OpenAI skill documentation](https://learn.chatgpt.com/docs/build-skills#where-to-save-skills).
 Restart Codex only if a newly installed skill does not appear.
 
+A confirmed install normally reports `installed`. If the atomic rename commits
+but parent-directory durability cannot be confirmed, the installer revalidates
+the canonical destination and reports `installed-with-durability-warning` as a
+successful install that should be checked again after a system restart.
+
 This is a local/repository-scoped installation, not a release or publication.
 The official documentation recommends a plugin for broader reusable
 distribution; plugin packaging is outside v1 and outside this repository gate.

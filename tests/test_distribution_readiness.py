@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,21 @@ class DistributionReadinessTests(unittest.TestCase):
         cls.english = ENGLISH_GUIDE.read_text(encoding="utf-8")
         cls.chinese = CHINESE_GUIDE.read_text(encoding="utf-8")
 
+    def assert_no_installer_artifacts(self, consumer: Path) -> None:
+        skills = consumer / ".agents" / "skills"
+        if not skills.exists():
+            return
+        self.assertFalse(list(skills.glob(".workspace-organizer.install-*")))
+        self.assertFalse(list(skills.glob("*.failed")))
+        unexpected_packages = [
+            child
+            for child in skills.iterdir()
+            if child.name != "workspace-organizer"
+            and child.is_dir()
+            and (child / "SKILL.md").is_file()
+        ]
+        self.assertEqual(unexpected_packages, [])
+
     def test_bilingual_guides_have_equivalent_auditable_coverage(self) -> None:
         for coverage_id in COVERAGE_IDS:
             marker = f"<!-- coverage:{coverage_id} -->"
@@ -83,6 +99,10 @@ class DistributionReadinessTests(unittest.TestCase):
             "第二数据源",
         ):
             self.assertIn(token, self.chinese)
+        self.assertIn("Task IDs are stable lowercase ASCII slugs.", self.english)
+        self.assertIn("任务 ID 是稳定的小写 ASCII slug。", self.chinese)
+        for guide in (self.english, self.chinese):
+            self.assertIn("installed-with-durability-warning", guide)
 
     def test_documented_validation_commands_and_prerequisites_are_exact(self) -> None:
         commands = (
@@ -259,6 +279,7 @@ class DistributionReadinessTests(unittest.TestCase):
             self.assertFalse(
                 (interrupted / ".agents" / "skills" / "workspace-organizer").exists()
             )
+            self.assert_no_installer_artifacts(interrupted)
 
             collided = base / "collided"
             collided.mkdir()
@@ -281,6 +302,85 @@ class DistributionReadinessTests(unittest.TestCase):
                 (collided / ".agents" / "skills" / "workspace-organizer" / "keep.txt").read_bytes(),
                 user_bytes,
             )
+            self.assert_no_installer_artifacts(collided)
+
+    def test_installer_cleans_mid_copy_and_base_exception_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = REPO_ROOT / "skill" / "workspace-organizer"
+            mid_copy = base / "mid-copy"
+            mid_copy.mkdir()
+
+            def fail_mid_copy(stage: str) -> None:
+                if stage == "source-entry-statted:references/tooling.md":
+                    raise RuntimeError("injected mid-copy failure")
+
+            with self.assertRaisesRegex(RuntimeError, "injected mid-copy failure"):
+                installer.install_skill(
+                    source,
+                    mid_copy,
+                    confirmed=True,
+                    _test_hook=fail_mid_copy,
+                )
+            self.assert_no_installer_artifacts(mid_copy)
+            self.assertFalse(
+                (mid_copy / ".agents" / "skills" / "workspace-organizer").exists()
+            )
+
+            interrupted = base / "base-exception"
+            interrupted.mkdir()
+
+            def interrupt_after_staging(stage: str) -> None:
+                if stage == "staging-complete":
+                    raise KeyboardInterrupt()
+
+            with self.assertRaises(KeyboardInterrupt):
+                installer.install_skill(
+                    source,
+                    interrupted,
+                    confirmed=True,
+                    _test_hook=interrupt_after_staging,
+                )
+            self.assert_no_installer_artifacts(interrupted)
+            self.assertFalse(
+                (interrupted / ".agents" / "skills" / "workspace-organizer").exists()
+            )
+
+    def test_installer_reconciles_post_rename_parent_fsync_failure_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            consumer = Path(temporary) / "consumer"
+            consumer.mkdir()
+            source = REPO_ROOT / "skill" / "workspace-organizer"
+            armed = {"value": False}
+            real_fsync = installer.os.fsync
+
+            def arm_failure(stage: str) -> None:
+                if stage == "before-publish-fsync":
+                    armed["value"] = True
+
+            def fail_committed_parent_fsync(descriptor: int) -> None:
+                if armed["value"]:
+                    raise OSError("injected parent fsync failure")
+                real_fsync(descriptor)
+
+            with mock.patch.object(
+                installer.os,
+                "fsync",
+                side_effect=fail_committed_parent_fsync,
+            ):
+                result = installer.install_skill(
+                    source,
+                    consumer,
+                    confirmed=True,
+                    _test_hook=arm_failure,
+                )
+            self.assertEqual(result["status"], "installed-with-durability-warning")
+            self.assertEqual(result["durability"], "uncertain")
+            destination = consumer / ".agents" / "skills" / "workspace-organizer"
+            self.assertTrue((destination / "SKILL.md").is_file())
+            self.assert_no_installer_artifacts(consumer)
+            with self.assertRaisesRegex(installer.InstallError, "refusing to overwrite"):
+                installer.install_skill(source, consumer, confirmed=True)
 
     def test_public_docs_examples_skill_and_fixtures_are_safe_and_linked(self) -> None:
         self.assertEqual(public_check.validate_public_content(REPO_ROOT), [])
@@ -314,6 +414,50 @@ class DistributionReadinessTests(unittest.TestCase):
             docs.joinpath("linked.txt").symlink_to(outside)
             errors = public_check.validate_public_content(root)
             self.assertTrue(any("must not be a symlink" in error for error in errors), errors)
+
+    def test_public_scan_rejects_same_inode_growth_shrink_and_replacement_races(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "docs" / "growing.txt"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"x")
+            original_inode = target.stat().st_ino
+
+            def grow_after_open(stage: str) -> None:
+                if stage == "after-open:docs/growing.txt":
+                    target.write_bytes(b"x" * (public_check.MAX_PUBLIC_FILE_BYTES + 1))
+                    self.assertEqual(target.stat().st_ino, original_inode)
+
+            errors = public_check.validate_public_content(root, _test_hook=grow_after_open)
+            self.assertTrue(any("exceeds public-file limit" in error for error in errors), errors)
+            self.assertTrue(any("changed during read" in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "docs" / "shrinking.txt"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"synthetic public text\n")
+
+            def shrink_after_open(stage: str) -> None:
+                if stage == "after-open:docs/shrinking.txt":
+                    target.write_bytes(b"")
+
+            errors = public_check.validate_public_content(root, _test_hook=shrink_after_open)
+            self.assertTrue(any("changed during read" in error for error in errors), errors)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "docs" / "replaced.txt"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"original public text\n")
+
+            def replace_after_lstat(stage: str) -> None:
+                if stage == "after-lstat:docs/replaced.txt":
+                    target.rename(target.with_suffix(".original"))
+                    target.write_bytes(b"replacement public text\n")
+
+            errors = public_check.validate_public_content(root, _test_hook=replace_after_lstat)
+            self.assertTrue(any("changed before read" in error for error in errors), errors)
 
     def test_isolated_installed_package_runs_representative_flows(self) -> None:
         result = forward_test.forward_test(REPO_ROOT)
