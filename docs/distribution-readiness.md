@@ -22,6 +22,7 @@ in each guide and checks the corresponding safety vocabulary.
 | `task-updates` | Stable record/path and full validation | 稳定记录/路径与完整验证 |
 | `views` | Atomic deterministic local projections | 原子、确定性的本地投影 |
 | `archive` | Eligibility, sole destination, and verified move | 资格、唯一目标与验证移动 |
+| `dashboard` | Optional deterministic read-only projection | 可选、确定性的只读投影 |
 | `rollback` | Evidence-preserving failure and recovery expectations | 保留证据的失败与恢复预期 |
 | `limits` | Local v1 limits and read-only dashboard boundary | 本地 v1 限制与只读看板边界 |
 | `validation` | Reproducible public repository gates | 可复现的公开仓库门禁 |
@@ -43,6 +44,7 @@ The gate executes these named stages and stops on the first failure:
 | Focused package/model/tooling tests | Skill structure, model, and safe operations |
 | Scenario matrix tests | Seven families plus initialization/adoption edge cases |
 | Distribution-readiness tests | Bilingual parity, install, links, and public hygiene |
+| Dashboard v2 tests | Determinism, provenance, sensitivity, injection, stale state, and read-only UI |
 | Full repository tests | No suite is omitted from the delivery candidate |
 | Public-content hygiene | Docs/examples/contracts/schemas/scripts/skill/fixtures have safe size, links, and content |
 | Isolated forward test | Installed skill runs initialization, adoption, views, and archive |
@@ -80,9 +82,9 @@ untracked fixture.
 
 ## Release boundary
 
-Passing this record means the v1 source tree is ready for review. It does not
+Passing this record means the source tree is ready for review. It does not
 mean a tag or release was created, a marketplace/plugin was published, or GitHub
 rules were changed. V1 remains usable as a standalone local skill with no HTML
-dashboard. Issue #7 may add a read-only static TODO/timeline consumer of the same
-canonical generated catalogs; it must keep sensitivity filtering and cannot
-become a second data source.
+dashboard assets. The optional v2 dashboard consumes the same canonical
+generated catalogs, keeps sensitivity filtering, and cannot become a second data
+source.

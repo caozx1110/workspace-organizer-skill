@@ -43,6 +43,7 @@ export WO_CONSUMER_REPO="/absolute/path/to/consumer-repository"
 export WO_ROOT="/absolute/path/to/workspace"
 export WO_PLAN_ROOT="/absolute/path/to/private-plan-directory"
 export WO_TOOL="$WO_CONSUMER_REPO/.agents/skills/workspace-organizer/scripts/workspace_organizer.py"
+export WO_DASHBOARD="$WO_CONSUMER_REPO/.agents/skills/workspace-organizer/scripts/workspace_dashboard.py"
 ```
 
 <!-- coverage:installation -->
@@ -207,6 +208,37 @@ python3 "$WO_TOOL" verify "$WO_ROOT" --plan "$WO_PLAN_ROOT/archive.json"
 The verified archive updates the canonical record and moves the whole bundle
 once. It never overwrites an existing destination.
 
+<!-- coverage:dashboard -->
+## Generate the optional read-only dashboard
+
+The local v2 dashboard is a disposable projection, not a second source of truth.
+Regenerate the stable v1 catalogs first, then generate and verify the four static
+files under `.workspace-organizer/dashboard/`:
+
+```sh
+python3 "$WO_TOOL" index "$WO_ROOT"
+python3 "$WO_DASHBOARD" generate "$WO_ROOT"
+python3 "$WO_DASHBOARD" verify "$WO_ROOT"
+```
+
+The generator independently rebuilds the expected TODO and timeline catalogs
+from canonical configuration and `TASK.md`, then requires the stored v1 catalogs
+to match exactly. It fails closed on stale, forged, malformed, unknown, or
+sensitive input before rendering, counting, grouping, or dashboard hashing.
+Every displayed item is a safely escaped relative link to its canonical
+`TASK.md`; task bodies and file contents are not copied.
+
+The HTML is static and uses packaged CSS and JavaScript under a restrictive CSP.
+Controls only switch the TODO/timeline view and filter displayed priority. There
+are no forms, editable fields, network requests, database, service worker,
+telemetry, approval controls, archive controls, or operation endpoints. The page
+shows a deterministic source fingerprint rather than a wall-clock timestamp.
+Run `verify` to identify a stale snapshot.
+
+Dashboard files are optional. If they are missing or removed, use the v1 CLI
+normally for initialization, adoption, indexing, approval, apply, verification,
+and archive.
+
 <!-- coverage:rollback -->
 ## Rollback and failure expectations
 
@@ -235,10 +267,9 @@ reversed only as a verified rollback of that exact archive operation.
   the tool never extracts them.
 - Large-file hashes may be deferred during scan. Default views still hash only
   eligible visible material when building the material catalog.
-- V1 has no HTML dashboard and needs none to initialize, adopt, update tasks,
-  generate views, or archive. Issue #7 owns a later read-only static consumer of
-  the same canonical, sensitivity-filtered data; it must not become editable or
-  authoritative.
+- The optional HTML dashboard is a read-only static consumer of canonical,
+  sensitivity-filtered data. V1 needs none of its assets to initialize, adopt,
+  update tasks, generate views, or archive.
 
 <!-- coverage:validation -->
 ## Validate the distribution

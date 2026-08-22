@@ -45,6 +45,7 @@ COVERAGE_IDS = (
     "task-updates",
     "views",
     "archive",
+    "dashboard",
     "rollback",
     "limits",
     "validation",
@@ -89,7 +90,6 @@ class DistributionReadinessTests(unittest.TestCase):
             "no overwrite",
             "no deletion",
             "no publication",
-            "Issue #7",
             "read-only",
             "second source of truth",
         ):
@@ -100,7 +100,6 @@ class DistributionReadinessTests(unittest.TestCase):
             "不覆盖",
             "不删除",
             "不发布",
-            "Issue #7",
             "只读",
             "第二数据源",
         ):
