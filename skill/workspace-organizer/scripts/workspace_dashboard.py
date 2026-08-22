@@ -14,7 +14,7 @@ import stat
 import sys
 import unicodedata
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import workspace_organizer as core
@@ -71,6 +71,143 @@ def _snapshot(value: os.stat_result) -> Tuple[int, int, int, int, int, int]:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
+
+
+def _directory_identity(value: os.stat_result) -> Tuple[int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
+
+
+def _open_directory(path: Path, context: str) -> int:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise DashboardError(f"{context}: cannot open no-follow directory: {exc}") from exc
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise DashboardError(f"{context}: must be a directory")
+    return descriptor
+
+
+def _open_directory_at(parent_fd: int, name: str, context: str) -> int:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise DashboardError(f"{context}: cannot open no-follow directory: {exc}") from exc
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise DashboardError(f"{context}: must be a directory")
+    return descriptor
+
+
+def _dashboard_entry(control_fd: int) -> Optional[str]:
+    target_key = unicodedata.normalize("NFC", "dashboard").casefold()
+    matches = [
+        name
+        for name in os.listdir(control_fd)
+        if unicodedata.normalize("NFC", name).casefold() == target_key
+    ]
+    if len(matches) > 1 or (matches and matches[0] != "dashboard"):
+        rendered = ", ".join(sorted(repr(name) for name in matches))
+        raise DashboardError(
+            f".workspace-organizer: normalized dashboard name collision: {rendered}"
+        )
+    return matches[0] if matches else None
+
+
+class _DashboardDirectory:
+    def __init__(
+        self, root: Path, root_fd: int, control_fd: int, dashboard_fd: int
+    ) -> None:
+        self.root = root
+        self.root_fd = root_fd
+        self.control_fd = control_fd
+        self.dashboard_fd = dashboard_fd
+        self.root_identity = _directory_identity(os.fstat(root_fd))
+        self.control_identity = _directory_identity(os.fstat(control_fd))
+        self.dashboard_identity = _directory_identity(os.fstat(dashboard_fd))
+
+    def close(self) -> None:
+        for descriptor in (self.dashboard_fd, self.control_fd, self.root_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+        self.dashboard_fd = -1
+        self.control_fd = -1
+        self.root_fd = -1
+
+    def assert_bound(self) -> None:
+        reopened_root: Optional[int] = None
+        reopened_control: Optional[int] = None
+        reopened_dashboard: Optional[int] = None
+        try:
+            try:
+                root_info = self.root.lstat()
+            except OSError as exc:
+                raise DashboardError(
+                    f"{self.root}: canonical workspace binding is unavailable: {exc}"
+                ) from exc
+            if stat.S_ISLNK(root_info.st_mode) or _directory_identity(root_info) != self.root_identity:
+                raise DashboardError(f"{self.root}: canonical workspace binding changed")
+            reopened_root = _open_directory(self.root, str(self.root))
+            if _directory_identity(os.fstat(reopened_root)) != self.root_identity:
+                raise DashboardError(f"{self.root}: canonical workspace binding changed")
+
+            control_info = os.stat(
+                ".workspace-organizer", dir_fd=self.root_fd, follow_symlinks=False
+            )
+            if (
+                stat.S_ISLNK(control_info.st_mode)
+                or _directory_identity(control_info) != self.control_identity
+            ):
+                raise DashboardError(
+                    ".workspace-organizer: canonical control-directory binding changed"
+                )
+            reopened_control = _open_directory_at(
+                self.root_fd, ".workspace-organizer", ".workspace-organizer"
+            )
+            if _directory_identity(os.fstat(reopened_control)) != self.control_identity:
+                raise DashboardError(
+                    ".workspace-organizer: canonical control-directory binding changed"
+                )
+            _dashboard_entry(self.control_fd)
+
+            dashboard_info = os.stat(
+                "dashboard", dir_fd=self.control_fd, follow_symlinks=False
+            )
+            if (
+                stat.S_ISLNK(dashboard_info.st_mode)
+                or _directory_identity(dashboard_info) != self.dashboard_identity
+            ):
+                raise DashboardError(
+                    f"{DASHBOARD_RELATIVE}: canonical dashboard binding changed"
+                )
+            reopened_dashboard = _open_directory_at(
+                self.control_fd, "dashboard", DASHBOARD_RELATIVE
+            )
+            if _directory_identity(os.fstat(reopened_dashboard)) != self.dashboard_identity:
+                raise DashboardError(
+                    f"{DASHBOARD_RELATIVE}: canonical dashboard binding changed"
+                )
+        except FileNotFoundError as exc:
+            raise DashboardError(
+                f"{DASHBOARD_RELATIVE}: canonical parent binding changed"
+            ) from exc
+        finally:
+            for descriptor in (reopened_dashboard, reopened_control, reopened_root):
+                if descriptor is not None:
+                    os.close(descriptor)
 
 
 def _read_regular(path: Path, context: str, *, limit: int = MAX_INPUT_BYTES) -> bytes:
@@ -146,7 +283,8 @@ def _validate_catalog_shape(catalog: Any, view: str) -> Mapping[str, Any]:
     if not isinstance(catalog["items"], list):
         raise DashboardError(f"{view} catalog: items must be an array")
     for item in catalog["items"]:
-        if not isinstance(item, dict) or item.get("sensitivity") not in VISIBLE_SENSITIVITIES:
+        sensitivity = item.get("sensitivity") if isinstance(item, dict) else None
+        if not isinstance(sensitivity, str) or sensitivity not in VISIBLE_SENSITIVITIES:
             raise DashboardError(
                 f"{view} catalog: sensitivity is not provably visible"
             )
@@ -181,7 +319,7 @@ def _canonical_provenance(root: Path) -> Dict[str, Mapping[str, Any]]:
     for record in records:
         data = record["data"]
         sensitivity = data.get("sensitivity")
-        if sensitivity not in VISIBLE_SENSITIVITIES:
+        if not isinstance(sensitivity, str) or sensitivity not in VISIBLE_SENSITIVITIES:
             continue
         if data["status"] not in core.OPEN_STATUSES:
             continue
@@ -197,7 +335,7 @@ def _cross_validate(
         if not isinstance(item, dict):
             raise DashboardError("todo catalog: every item must be an object")
         sensitivity = item.get("sensitivity")
-        if sensitivity not in VISIBLE_SENSITIVITIES:
+        if not isinstance(sensitivity, str) or sensitivity not in VISIBLE_SENSITIVITIES:
             raise DashboardError("todo catalog: sensitivity is not provably visible")
         record = item.get("record")
         if not isinstance(record, str):
@@ -242,7 +380,8 @@ def _cross_validate(
     rank = {name: index for index, name in enumerate(PRIORITY_ORDER)}
     expected_timeline.sort(key=lambda item: (item["date"], rank[item["priority"]], item["id"]))
     for item in timeline["items"]:
-        if not isinstance(item, dict) or item.get("sensitivity") not in VISIBLE_SENSITIVITIES:
+        sensitivity = item.get("sensitivity") if isinstance(item, dict) else None
+        if not isinstance(sensitivity, str) or sensitivity not in VISIBLE_SENSITIVITIES:
             raise DashboardError("timeline catalog: item is malformed or not provably visible")
     if timeline["items"] != expected_timeline:
         raise DashboardError("timeline catalog: items disagree with canonical TODO due events")
@@ -438,37 +577,37 @@ def _valid_existing(name: str, payload: bytes) -> bool:
     )
 
 
-def _open_dashboard_directory(root: Path, *, create: bool) -> int:
-    control = root / ".workspace-organizer"
-    if control.is_symlink() or not control.is_dir():
-        raise DashboardError(".workspace-organizer: must be a no-follow directory")
-    control_fd = os.open(
-        control,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0),
-    )
+def _open_dashboard_directory(root: Path, *, create: bool) -> _DashboardDirectory:
+    root_fd: Optional[int] = None
+    control_fd: Optional[int] = None
+    dashboard_fd: Optional[int] = None
     try:
-        try:
-            info = os.stat("dashboard", dir_fd=control_fd, follow_symlinks=False)
-        except FileNotFoundError:
+        root_fd = _open_directory(root, str(root))
+        control_fd = _open_directory_at(
+            root_fd, ".workspace-organizer", ".workspace-organizer"
+        )
+        entry = _dashboard_entry(control_fd)
+        if entry is None:
             if not create:
                 raise StaleDashboard(f"{DASHBOARD_RELATIVE}: dashboard is missing")
             os.mkdir("dashboard", mode=0o700, dir_fd=control_fd)
-            info = os.stat("dashboard", dir_fd=control_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise DashboardError(f"{DASHBOARD_RELATIVE}: must be a no-follow directory")
-        return os.open(
-            "dashboard",
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=control_fd,
-        )
-    finally:
-        os.close(control_fd)
+            entry = _dashboard_entry(control_fd)
+            if entry != "dashboard":
+                raise DashboardError(
+                    f"{DASHBOARD_RELATIVE}: canonical dashboard entry was not created"
+                )
+        dashboard_fd = _open_directory_at(control_fd, "dashboard", DASHBOARD_RELATIVE)
+        binding = _DashboardDirectory(root, root_fd, control_fd, dashboard_fd)
+        root_fd = None
+        control_fd = None
+        dashboard_fd = None
+        binding.assert_bound()
+        return binding
+    except BaseException:
+        for descriptor in (dashboard_fd, control_fd, root_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        raise
 
 
 def _read_regular_at(directory_fd: int, name: str) -> bytes:
@@ -523,8 +662,12 @@ def _capture_existing(directory_fd: int) -> Dict[str, bytes]:
 
 
 def _write_outputs(
-    directory_fd: int, outputs: Mapping[str, bytes], existing: Mapping[str, bytes]
+    binding: _DashboardDirectory,
+    outputs: Mapping[str, bytes],
+    existing: Mapping[str, bytes],
+    test_hook: Optional[Callable[[str], None]] = None,
 ) -> None:
+    directory_fd = binding.dashboard_fd
     temporary: List[str] = []
     installed: List[Tuple[str, Optional[str]]] = []
     try:
@@ -553,6 +696,9 @@ def _write_outputs(
             finally:
                 os.close(descriptor)
         for temporary_name, name in zip(list(temporary), DASHBOARD_FILES):
+            if test_hook is not None:
+                test_hook(f"before-install:{name}")
+            binding.assert_bound()
             if name in existing:
                 core._exchange_entries_at(
                     directory_fd, temporary_name, directory_fd, name
@@ -571,6 +717,9 @@ def _write_outputs(
             temporary.remove(temporary_name)
             if _read_regular_at(directory_fd, name) != outputs[name]:
                 raise DashboardError(f"{DASHBOARD_RELATIVE}/{name}: installed bytes changed")
+        if test_hook is not None:
+            test_hook("before-success")
+        binding.assert_bound()
         os.fsync(directory_fd)
     except BaseException:
         for name, backup in reversed(installed):
@@ -599,21 +748,27 @@ def _write_outputs(
                 pass
 
 
-def generate_dashboard(root: Path) -> Mapping[str, Any]:
+def generate_dashboard(
+    root: Path, *, _test_hook: Optional[Callable[[str], None]] = None
+) -> Mapping[str, Any]:
     root = core._workspace_root(root)
     outputs, fingerprint = build_dashboard_outputs(root)
-    directory_fd = _open_dashboard_directory(root, create=True)
+    binding = _open_dashboard_directory(root, create=True)
     try:
-        existing = _capture_existing(directory_fd)
+        existing = _capture_existing(binding.dashboard_fd)
         if existing == outputs:
+            if _test_hook is not None:
+                _test_hook("before-success")
+            binding.assert_bound()
             status = "unchanged"
         else:
-            _write_outputs(directory_fd, outputs, existing)
-            if _capture_existing(directory_fd) != outputs:
+            _write_outputs(binding, outputs, existing, _test_hook)
+            if _capture_existing(binding.dashboard_fd) != outputs:
                 raise DashboardError(f"{DASHBOARD_RELATIVE}: post-write verification failed")
+            binding.assert_bound()
             status = "generated"
     finally:
-        os.close(directory_fd)
+        binding.close()
     return {
         "schema_version": 1,
         "operation": "dashboard-generate",
@@ -624,15 +779,20 @@ def generate_dashboard(root: Path) -> Mapping[str, Any]:
     }
 
 
-def verify_dashboard(root: Path) -> Mapping[str, Any]:
+def verify_dashboard(
+    root: Path, *, _test_hook: Optional[Callable[[str], None]] = None
+) -> Mapping[str, Any]:
     root = core._workspace_root(root)
     try:
         outputs, fingerprint = build_dashboard_outputs(root)
-        directory_fd = _open_dashboard_directory(root, create=False)
+        binding = _open_dashboard_directory(root, create=False)
         try:
-            existing = _capture_existing(directory_fd)
+            existing = _capture_existing(binding.dashboard_fd)
+            if _test_hook is not None:
+                _test_hook("before-verify-success")
+            binding.assert_bound()
         finally:
-            os.close(directory_fd)
+            binding.close()
     except StaleDashboard as exc:
         return {
             "schema_version": 1,

@@ -306,6 +306,121 @@ class DashboardTests(unittest.TestCase):
                 dashboard.generate_dashboard(collision)
             self.assertEqual(user_owned.read_text(encoding="utf-8"), "user-owned dashboard\n")
 
+    def test_control_parent_replacement_is_detected_and_installed_asset_is_rolled_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = self.make_workspace(
+                base / "race",
+                [("20_任务/visible", _task("visible", title="Visible record"))],
+            )
+            control = root / ".workspace-organizer"
+            moved_control = root / ".workspace-organizer-original"
+            outside = base / "outside-control"
+            outside.mkdir()
+
+            def replace_parent(stage: str) -> None:
+                if stage == "before-install:styles.css":
+                    control.rename(moved_control)
+                    control.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                dashboard.DashboardError, "control-directory binding changed"
+            ):
+                dashboard.generate_dashboard(root, _test_hook=replace_parent)
+            original_dashboard = moved_control / "dashboard"
+            self.assertTrue(original_dashboard.is_dir())
+            self.assertEqual(list(original_dashboard.iterdir()), [])
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_verify_rejects_control_parent_replacement_after_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = self.make_workspace(
+                base / "verify-race",
+                [("20_任务/visible", _task("visible", title="Visible record"))],
+            )
+            dashboard.generate_dashboard(root)
+            control = root / ".workspace-organizer"
+            moved_control = root / ".workspace-organizer-original"
+            outside = base / "outside-control"
+            outside.mkdir()
+
+            def replace_parent(stage: str) -> None:
+                if stage == "before-verify-success":
+                    control.rename(moved_control)
+                    control.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                dashboard.DashboardError, "control-directory binding changed"
+            ):
+                dashboard.verify_dashboard(root, _test_hook=replace_parent)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(
+                set(path.name for path in (moved_control / "dashboard").iterdir()),
+                set(dashboard.DASHBOARD_FILES),
+            )
+
+    def test_normalized_dashboard_name_collision_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.make_workspace(
+                Path(temporary),
+                [("20_任务/visible", _task("visible", title="Visible record"))],
+            )
+            collision = root / ".workspace-organizer" / "Dashboard"
+            collision.mkdir()
+            with self.assertRaisesRegex(
+                dashboard.DashboardError, "normalized dashboard name collision"
+            ):
+                dashboard.generate_dashboard(root)
+            self.assertEqual(
+                [path.name for path in (root / ".workspace-organizer").iterdir() if path.name.casefold() == "dashboard"],
+                ["Dashboard"],
+            )
+            self.assertEqual(list(collision.iterdir()), [])
+
+    def test_non_string_catalog_sensitivity_is_an_auditable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.make_workspace(
+                Path(temporary),
+                [("20_任务/visible", _task("visible", title="Visible record"))],
+            )
+            catalog_path = root / ".workspace-organizer" / "catalog" / "todo.json"
+            original = catalog_path.read_bytes()
+            cli = SCRIPT_ROOT / "workspace_dashboard.py"
+            for sensitivity in ({"level": "internal"}, ["internal"]):
+                catalog = json.loads(original.decode("utf-8"))
+                catalog["items"][0]["sensitivity"] = sensitivity
+                catalog["source_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        catalog["items"],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                with self.assertRaisesRegex(
+                    dashboard.DashboardError, "sensitivity is not provably visible"
+                ):
+                    dashboard._validate_catalog_shape(catalog, "todo")
+                catalog_path.write_text(
+                    json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                completed = subprocess.run(
+                    [sys.executable, str(cli), "generate", str(root)],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("workspace-dashboard:", completed.stderr)
+                self.assertIn("stale or not canonical", completed.stderr)
+                self.assertNotIn("TypeError", completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
+                catalog_path.write_bytes(original)
+
     def test_verify_reports_missing_catalog_and_changed_canonical_state_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = self.make_workspace(
