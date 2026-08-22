@@ -20,6 +20,22 @@ scan -> proposal -> dry-run -> exact approval -> apply -> verify
 字节的精确批准；一旦修改计划，批准立即失效。默认不覆盖、不删除、不发布，也不推断
 材料归属。
 
+<!-- coverage:quick-route -->
+## 快速路由
+
+按目标选择最短路径：
+
+| 目标 | 第一步 | 接着阅读 |
+| --- | --- | --- |
+| 新建或接纳工作区 | `inventory`，然后 `plan-init` | [初始化与接纳](../skill/workspace-organizer/references/initialization-and-adoption.md) |
+| 检查文件 | `inventory` 或 `scan` | [工具参考](../skill/workspace-organizer/references/tooling.md) |
+| 刷新本地视图 | `index` | [视图与归档](../skill/workspace-organizer/references/views-and-archive.md) |
+| 归档已关闭任务 | `plan-archive` | [视图与归档](../skill/workspace-organizer/references/views-and-archive.md) |
+| 使用可选看板 | dashboard `generate` / `verify` | [看板](../skill/workspace-organizer/references/dashboard.md) |
+
+只有初始化、整理和归档需要批准计划。面向维护者和安全审查的底层保证另见
+[高级工具保证](../skill/workspace-organizer/references/implementation-guarantees.md)。
+
 <!-- coverage:prerequisites -->
 ## 前置条件
 

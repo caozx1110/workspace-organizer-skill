@@ -8,6 +8,26 @@ description: Initialize and safely organize durable filesystem workspaces for ta
 Organize durable work around canonical task records while preserving user files and
 making every structural change reviewable.
 
+## Quick route
+
+Start with the smallest route that matches the request. Read the linked reference
+only when that operation is in scope.
+
+| Request | First step | Reference |
+| --- | --- | --- |
+| Set up a new workspace or adopt folders | `inventory`, then `plan-init` | [initialization and adoption](references/initialization-and-adoption.md) |
+| Inspect or classify existing files | `inventory` or `scan` | [tooling](references/tooling.md) |
+| Move explicitly selected material | `plan-organize` | [tooling](references/tooling.md) |
+| Refresh TODO, timeline, and materials | `index` | [views and archive](references/views-and-archive.md) |
+| Archive a closed task | `plan-archive` | [views and archive](references/views-and-archive.md) |
+| Generate or check the local board | dashboard `generate` / `verify` | [dashboard](references/dashboard.md) |
+
+`inventory`, `scan`, `index`, and dashboard verification are read-only from the
+user's perspective. Initialization, organizing, and archiving are structural
+mutations and require `dry-run` followed by exact `approve --yes`, `apply`, and
+`verify`. The detailed filesystem guarantees are kept in the
+[advanced tooling reference](references/implementation-guarantees.md).
+
 ## Establish the operation
 
 1. Confirm the workspace root and the user's requested outcome.

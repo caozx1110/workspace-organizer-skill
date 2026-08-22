@@ -29,6 +29,7 @@ class SkillPackageTests(unittest.TestCase):
             "references/views-and-archive.md",
             "references/dashboard.md",
             "references/tooling.md",
+            "references/implementation-guarantees.md",
             "scripts/workspace_organizer.py",
             "scripts/workspace_dashboard.py",
             "assets/workspace-config.json",
@@ -66,6 +67,7 @@ class SkillPackageTests(unittest.TestCase):
             "references/views-and-archive.md",
             "references/dashboard.md",
             "references/tooling.md",
+            "references/implementation-guarantees.md",
         ):
             self.assertIn(reference, text)
             self.assertTrue((SKILL_ROOT / reference).is_file())
