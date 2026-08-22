@@ -23,6 +23,23 @@ explicit decision bound to the exact plan bytes; changing the plan invalidates
 that approval. The default is no overwrite, no deletion, no publication, and no
 inferred ownership.
 
+<!-- coverage:quick-route -->
+## Quick route
+
+Use the smallest workflow that matches your goal:
+
+| Goal | First command | Read next |
+| --- | --- | --- |
+| New or adopted workspace | `inventory`, then `plan-init` | [initialization and adoption](../skill/workspace-organizer/references/initialization-and-adoption.md) |
+| Inspect files | `inventory` or `scan` | [tooling](../skill/workspace-organizer/references/tooling.md) |
+| Refresh local views | `index` | [views and archive](../skill/workspace-organizer/references/views-and-archive.md) |
+| Archive a closed task | `plan-archive` | [views and archive](../skill/workspace-organizer/references/views-and-archive.md) |
+| Use the optional board | dashboard `generate` / `verify` | [dashboard](../skill/workspace-organizer/references/dashboard.md) |
+
+Only initialization, organizing, and archiving require an approved plan. The
+[advanced guarantees](../skill/workspace-organizer/references/implementation-guarantees.md)
+are available separately for maintainers and security review.
+
 <!-- coverage:prerequisites -->
 ## Prerequisites
 

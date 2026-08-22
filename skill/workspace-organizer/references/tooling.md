@@ -46,49 +46,17 @@ configuration target and digest, adopted archive includes the registration
 before/after transition, and organize reports every independently detectable
 source or destination error rather than stopping after the first collision.
 
-Apply rejects a missing, stale, altered, or mismatched plan/approval. Before the
-first workspace mutation it persists an immutable intent containing the exact
-plan digest, source/destination evidence, configuration transition (when
-applicable), and rollback inputs. Immutable write-ahead stage records then
-precede parent creation, controlled temporary copies, atomic no-replace
-installation, configuration replacement, and source removal. Files and archive
-trees become visible at their final destination only after a verified temporary
-copy is complete. Source removal occurs only after reopening and verifying the
-installed destination through the workspace root.
-
-Removing an adopted-task registration uses an atomic exchange: the displaced
-configuration inode remains available as a verified backup until both the old
-and new bytes pass their transition-boundary checks. An identity or content
-change exchanges the prior inode back and retains durable evidence instead of
-silently overwriting a concurrent configuration update.
-
-Durable records normally live under `.workspace-organizer/verification/` (or
-the existing control directory when upgrading an older workspace without that
-role). Initialization records stay beside the external initialization plan so
-an interruption remains discoverable even before the control directory exists.
-Repeated apply is read-only and succeeds only while a verified result still
-matches. An intent without a verified result, a failed result, an interrupt, or
-a final-result write failure blocks blind retry. Preserve the intent, WAL,
-source/destination hashes, configuration before/after evidence, and rollback
-inputs for bounded manual recovery before preparing a new plan.
+Apply rejects a missing, stale, altered, or mismatched plan/approval. For the
+implementation-level durability, concurrency, and recovery guarantees, see
+[advanced tooling guarantees](implementation-guarantees.md).
 
 ## Generate projections
 
-`index ROOT` validates all canonical inputs, filters sensitivity, builds all six
-catalog/Markdown outputs, and stages them in a controlled transaction directory.
-Target parents remain bound by no-follow directory descriptors. At every commit
-boundary all six target identities and prior bytes are rechecked; existing
-targets use atomic exchange, while absent targets use atomic no-replace install.
-The displaced files serve as rollback backups. Any `BaseException`, including
-`KeyboardInterrupt`, rolls installed targets back in reverse order when they
-still match the transaction. Rollback atomically exchanges or moves each
-current target into the transaction before validating its inode and bytes; if
-the displaced file is concurrent user content, it is immediately restored and
-the transaction is retained. Concurrent user changes are never overwritten or
-unlinked.
-Incomplete rollback evidence is retained under the cache for manual recovery.
-An unmarked overview, symlink, invalid record, collision, or write failure keeps
-the previous known-good set. Repeating an unchanged render performs no writes.
+`index ROOT` validates canonical inputs, filters sensitivity, and regenerates the
+six catalog/Markdown outputs as one controlled transaction. It leaves the last
+known-good set intact on validation or generation failure and performs no writes
+when the inputs are unchanged. See [advanced tooling guarantees](implementation-guarantees.md)
+for the low-level atomicity and recovery contract.
 
 The module also exposes the command implementations as Python functions for
 tests or a trusted host integration. Do not bypass plan approval by calling
