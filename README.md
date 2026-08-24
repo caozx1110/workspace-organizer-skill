@@ -12,6 +12,7 @@ by default.
 
 - [English installation and user guide](docs/guide.en.md)
 - [中文安装与使用指南](docs/guide.zh-CN.md)
+- [Clean-slate 混合式设计合同（当前设计基线）](docs/design-contract.zh-CN.md)
 - [Normative v1 workspace model](docs/workspace-model.md)
 - [Auditable distribution-readiness checklist](docs/distribution-readiness.md)
 - [Optional read-only dashboard contract](skill/workspace-organizer/references/dashboard.md)
@@ -28,3 +29,7 @@ This repository does not tag, publish, or release anything as part of the gate.
 The v1 skill remains fully usable without dashboard assets. The optional v2
 dashboard is a deterministic, read-only local projection over the same
 sensitivity-filtered generated data; it never becomes task authority.
+
+> 设计方向说明：下一版将按 [clean-slate 设计合同](docs/design-contract.zh-CN.md)
+> 重新实现。Obsidian 作为日常驾驶舱，Chat/Agent 作为操作层，Markdown 是
+> 唯一事实来源；当前 v1 文档和测试暂作为历史参考，后续会随新实现整体重写。
