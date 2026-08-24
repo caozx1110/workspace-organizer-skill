@@ -792,10 +792,17 @@ def _iter_markdown_files(base: Path) -> Iterable[Path]:
         return
     for current, directories, filenames in os.walk(str(base), topdown=True, followlinks=False):
         current_path = Path(current)
+        if current_path != base and (current_path / ".git").exists():
+            # A nested repository is a hard ownership boundary.  Do not
+            # inspect either its metadata or ordinary files beneath it.
+            directories[:] = []
+            continue
         directories[:] = sorted(
             name
             for name in directories
-            if name != ".git" and not (current_path / name).is_symlink()
+            if name != ".git"
+            and not (current_path / name).is_symlink()
+            and not ((current_path / name / ".git").exists() if (current_path / name).is_dir() else False)
         )
         for name in sorted(filenames):
             if not name.endswith(".md"):

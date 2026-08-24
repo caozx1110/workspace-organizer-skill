@@ -201,12 +201,19 @@ class ViewRenderingTests(unittest.TestCase):
             nested = root / "20_任务/vendor/.git/secret.md"
             nested.parent.mkdir(parents=True)
             nested.write_text("---\nkind: task\nid: secret\n---\n", encoding="utf-8")
+            (nested.parent.parent / "visible-looking.md").write_text(
+                "---\nkind: task\nid: vendor\ntitle: Vendor secret\nstatus: active\n"
+                "storage_state: active\narea: ops\ntype: admin\npriority: normal\n"
+                "next_action: Read\nsensitivity: internal\n---\n",
+                encoding="utf-8",
+            )
             receipt = views.generate_views(root, now="2026-08-24", profile=None)
             self.assertEqual(receipt["profile"], "internal")
             next_page = (root / "00_总览/NEXT.md").read_text(encoding="utf-8")
             self.assertIn("运营", next_page)
             self.assertNotIn("Confidential", next_page)
             self.assertNotIn("secret", next_page)
+            self.assertNotIn("Vendor secret", next_page)
 
     def test_frontmatter_collection_does_not_decode_body(self):
         with tempfile.TemporaryDirectory() as temporary:
