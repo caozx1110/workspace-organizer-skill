@@ -13,7 +13,7 @@ views = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(views)
 
 
-def task(task_id, *, title=None, status="active", storage_state="active", sensitivity="internal", priority="normal", area="ops", scheduled_on=None, due_on=None, follow_up_on=None, next_action="Do the next thing", waiting_on=None, closed_at=None, closure_summary=None, record_path=None):
+def task(task_id, *, title=None, status="active", storage_state="active", sensitivity="internal", priority="normal", area="ops", scheduled_on=None, due_on=None, follow_up_on=None, next_action="Do the next thing", waiting_on=None, closed_at=None, archived_at=None, closure_summary=None, record_path=None):
     return {
         "kind": "task",
         "schema_version": 2,
@@ -32,6 +32,7 @@ def task(task_id, *, title=None, status="active", storage_state="active", sensit
         "waiting_on": waiting_on,
         "sensitivity": sensitivity,
         "closed_at": closed_at,
+        "archived_at": archived_at,
         "closure_summary": closure_summary,
         "record_path": record_path,
     }
@@ -75,9 +76,9 @@ class ViewRenderingTests(unittest.TestCase):
 
     def test_all_pages_have_marker_and_expected_projections(self):
         tasks = [
-            task("wait", status="waiting", follow_up_on="2026-08-24", waiting_on="Vendor", next_action=None),
+            task("wait", status="waiting", follow_up_on="2026-08-24", waiting_on="Vendor", next_action="Check vendor"),
             task("blocked", status="blocked", priority="urgent", waiting_on="Approval", next_action="Ask approver"),
-            task("done", status="completed", storage_state="archived", closed_at="2026-08-20T12:00:00+08:00", closure_summary="Submitted", next_action=None, record_path="90_归档/ops/2026/done/done.md"),
+            task("done", status="completed", storage_state="archived", closed_at="2026-08-20T12:00:00+08:00", archived_at="2026-08-20T13:00:00+08:00", closure_summary="Submitted", next_action=None, record_path="90_归档/ops/2026/done/done.md"),
         ]
         bundle = views.build_views(tasks, [capture("c")], now="2026-08-24")
         for relative, payload in bundle["files"].items():

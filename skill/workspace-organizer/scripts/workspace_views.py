@@ -171,8 +171,13 @@ def _sensitivity(value: Any, field: str = "sensitivity") -> str:
 
 
 def _profile_rank(profile: Any) -> tuple[str, int]:
+    if profile is None:
+        profile = "internal"
     if isinstance(profile, Mapping):
-        profile = profile.get("max_sensitivity", profile.get("sensitivity", "internal"))
+        profile = profile.get(
+            "max_sensitivity",
+            profile.get("view_max_sensitivity", profile.get("sensitivity", "internal")),
+        )
     if not isinstance(profile, str) or profile not in SENSITIVITY_RANK:
         raise ViewError("profile: must be public, internal, confidential, or restricted")
     return profile, SENSITIVITY_RANK[profile]
@@ -213,19 +218,33 @@ def _slugish(value: Any) -> str:
 
 
 def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
+    kind = raw.get("kind", "task")
+    if kind != "task":
+        raise ViewError("task record: kind must be task")
+    schema_version = raw.get("schema_version", SCHEMA_VERSION)
+    if schema_version != SCHEMA_VERSION:
+        raise ViewError("task record: unsupported schema_version")
     task_id = _id(raw.get("id", raw.get("task_id")), "task.id")
     status = _text(raw.get("status"), "task.status", required=True, maximum=32)
     assert status is not None
-    if status not in OPEN_STATUSES | CLOSED_STATUSES | {"archived"}:
+    if status not in OPEN_STATUSES | CLOSED_STATUSES:
         raise ViewError(f"task {task_id}: unknown status")
     storage_state = raw.get("storage_state")
     if storage_state is None:
         storage_state = "archived" if status == "archived" else "active"
     if storage_state not in {"active", "archived"}:
         raise ViewError(f"task {task_id}: unknown storage_state")
+    if status in OPEN_STATUSES and storage_state != "active":
+        raise ViewError(f"task {task_id}: open task cannot be archived")
+    if status in CLOSED_STATUSES and storage_state == "archived" and raw.get("archived_at") is None:
+        raise ViewError(f"task {task_id}: archived task requires archived_at")
     title = _text(raw.get("title", raw.get("name")), f"task {task_id}.title", required=True, maximum=300)
     area = _text(raw.get("area"), f"task {task_id}.area", required=True, maximum=128)
     typ = _text(raw.get("type"), f"task {task_id}.type", required=False, maximum=128) or "general"
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", area or ""):
+        raise ViewError(f"task {task_id}: area must be a lowercase key")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", typ):
+        raise ViewError(f"task {task_id}: type must be a lowercase key")
     priority = _text(raw.get("priority"), f"task {task_id}.priority", required=False, maximum=32) or "normal"
     if priority not in PRIORITY_RANK:
         raise ViewError(f"task {task_id}: unknown priority")
@@ -244,6 +263,19 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
     record_path = _record_path(raw, archived=(storage_state == "archived" or status == "archived"))
     if PurePosixPath(record_path).stem != task_id:
         raise ViewError(f"task {task_id}: canonical note filename must equal task id")
+    if status in OPEN_STATUSES and not next_action:
+        raise ViewError(f"task {task_id}: open task requires next_action")
+    if status in OPEN_STATUSES and (closed_at is not None or closure_summary is not None or raw.get("archived_at") is not None):
+        raise ViewError(f"task {task_id}: open task has closure metadata")
+    if status in CLOSED_STATUSES:
+        if not closed_at:
+            raise ViewError(f"task {task_id}: closed task requires closed_at")
+        if not closure_summary:
+            raise ViewError(f"task {task_id}: closed task requires closure_summary")
+        if next_action is not None:
+            raise ViewError(f"task {task_id}: closed task next_action must be null")
+        if storage_state == "active" and raw.get("archived_at") is not None:
+            raise ViewError(f"task {task_id}: active task has archived_at")
     result = dict(raw)
     result.update(
         id=task_id,
@@ -267,6 +299,10 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_capture(raw: Mapping[str, Any]) -> dict[str, Any]:
+    if raw.get("kind", "capture") != "capture":
+        raise ViewError("capture record: kind must be capture")
+    if raw.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
+        raise ViewError("capture record: unsupported schema_version")
     capture_id = _id(raw.get("id", raw.get("capture_id", raw.get("artifact_id"))), "capture.id")
     title = _text(raw.get("title", raw.get("summary", raw.get("name"))), f"capture {capture_id}.title", required=False, maximum=300)
     path_value = raw.get("path", raw.get("payload_path", raw.get("record_path")))
@@ -279,6 +315,8 @@ def _normalize_capture(raw: Mapping[str, Any]) -> dict[str, Any]:
     state = raw.get("triage_state", raw.get("state", raw.get("status", "inbox")))
     state = _text(state, f"capture {capture_id}.triage_state", required=True, maximum=32)
     assert state is not None
+    if state not in {"inbox", "pending", "untriaged", "captured", "deferred", "triaged"}:
+        raise ViewError(f"capture {capture_id}: unknown triage state")
     sensitivity = _sensitivity(raw.get("sensitivity"), f"capture {capture_id}.sensitivity")
     result = dict(raw)
     result.update(id=capture_id, title=title or (Path(path_value).stem if path_value else capture_id), path=path_value, captured_at=captured_at, triage_state=state, sensitivity=sensitivity)
@@ -289,12 +327,16 @@ def _is_inbox(capture: Mapping[str, Any]) -> bool:
     return capture.get("triage_state", "inbox").lower() in {"inbox", "pending", "untriaged", "captured"}
 
 
-def _safe_focus_ids(focus_ids: Iterable[str]) -> tuple[str, ...]:
+def _safe_focus_ids(focus_ids: Optional[Iterable[str]]) -> tuple[str, ...]:
+    if focus_ids is None:
+        return ()
     result: list[str] = []
     for value in focus_ids:
         value = _id(value, "focus id")
         if value not in result:
             result.append(value)
+    if len(result) > 3:
+        raise ViewError("focus_ids: at most three focus tasks are allowed")
     return tuple(sorted(result))
 
 
@@ -790,9 +832,13 @@ def _iter_markdown_files(base: Path) -> Iterable[Path]:
 
     if not base.is_dir() or base.is_symlink():
         return
+    def is_git_boundary(directory: Path) -> bool:
+        marker = directory / ".git"
+        return marker.is_symlink() or marker.exists()
+
     for current, directories, filenames in os.walk(str(base), topdown=True, followlinks=False):
         current_path = Path(current)
-        if current_path != base and (current_path / ".git").exists():
+        if current_path != base and is_git_boundary(current_path):
             # A nested repository is a hard ownership boundary.  Do not
             # inspect either its metadata or ordinary files beneath it.
             directories[:] = []
@@ -802,7 +848,7 @@ def _iter_markdown_files(base: Path) -> Iterable[Path]:
             for name in directories
             if name != ".git"
             and not (current_path / name).is_symlink()
-            and not ((current_path / name / ".git").exists() if (current_path / name).is_dir() else False)
+            and not is_git_boundary(current_path / name)
         )
         for name in sorted(filenames):
             if not name.endswith(".md"):
@@ -835,6 +881,12 @@ def collect_records(root: Union[str, os.PathLike[str]]) -> dict[str, list[dict[s
             seen_paths.add(path)
             data = _frontmatter(path)
             if not data or data.get("kind") not in {"task", "Task"}:
+                continue
+            task_id = data.get("id", data.get("task_id"))
+            if not isinstance(task_id, str) or path.stem != task_id or path.parent.name != task_id:
+                # Only the bundle-root note is canonical.  A Markdown task
+                # embedded in an artifact directory is not silently promoted
+                # into the global task queue.
                 continue
             data["record_path"] = path.relative_to(root_path).as_posix()
             tasks.append(data)
