@@ -238,6 +238,23 @@ class ViewRenderingTests(unittest.TestCase):
             with self.assertRaises(views.ViewError):
                 views.write_views(Path(temporary), tampered)
 
+    def test_visible_invalid_lifecycle_and_noncanonical_note_fail_or_skip(self):
+        broken = task("broken", status="completed", closed_at="not-a-timestamp", closure_summary="Done", next_action=None)
+        with self.assertRaises(views.ViewError):
+            views.build_views([broken], now="2026-08-24")
+        with self.assertRaises(views.ViewError):
+            views.build_views([task("one")], now="2026-08-24", focus_ids=["a", "b", "c", "d"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root / "20_任务/one/01_输入/one.md"
+            nested.parent.mkdir(parents=True)
+            nested.write_text(
+                "---\nkind: task\nid: one\ntitle: Fake\nstatus: active\nstorage_state: active\n"
+                "area: ops\ntype: admin\npriority: normal\nnext_action: Work\nsensitivity: internal\n---\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(views.collect_records(root)["tasks"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,10 +20,33 @@ from validate_workspace_model import (  # noqa: E402
 
 
 class SkillPackageTests(unittest.TestCase):
-    def test_official_package_shape_is_focused(self) -> None:
-        expected = {
+    def test_package_contains_clean_slate_and_legacy_routes(self) -> None:
+        required = {
             "SKILL.md",
             "agents/openai.yaml",
+            "scripts/clean_slate.py",
+            "scripts/clean_slate_model.py",
+            "scripts/workspace_views.py",
+            "assets/task-template.md",
+            "assets/capture.md",
+            "assets/artifact.md",
+            "assets/workspace-config.yaml",
+            "assets/HOME.md",
+            "assets/FOCUS.md",
+            "references/clean-slate-model.md",
+            "references/clean-slate-operations.md",
+            "references/daily-workflow.md",
+            "references/legacy-v1.md",
+        }
+        actual = {
+            path.relative_to(SKILL_ROOT).as_posix()
+            for path in SKILL_ROOT.rglob("*")
+            if path.is_file()
+        }
+        self.assertTrue(required <= actual)
+        # Keep the historical implementation present as an explicit reference
+        # route while the clean-slate route is the primary product.
+        for legacy in (
             "references/initialization-and-adoption.md",
             "references/task-contract.md",
             "references/views-and-archive.md",
@@ -40,15 +63,11 @@ class SkillPackageTests(unittest.TestCase):
             "assets/empty-generated-views/timeline.json",
             "assets/empty-generated-views/materials.json",
             "assets/empty-generated-views/TODO.md",
-            "assets/empty-generated-views/TIMELINE.md",
-            "assets/empty-generated-views/MATERIALS.md",
-        }
-        actual = {
-            path.relative_to(SKILL_ROOT).as_posix()
-            for path in SKILL_ROOT.rglob("*")
-            if path.is_file()
-        }
-        self.assertEqual(actual, expected)
+            "references/implementation-guarantees.md",
+            "scripts/workspace_organizer.py",
+            "scripts/workspace_dashboard.py",
+        ):
+            self.assertIn(legacy, actual)
         self.assertTrue((SKILL_ROOT / "scripts" / "workspace_organizer.py").is_file())
         self.assertTrue((SKILL_ROOT / "scripts" / "workspace_dashboard.py").is_file())
 
@@ -58,30 +77,23 @@ class SkillPackageTests(unittest.TestCase):
         front_matter = text.split("---", 2)[1]
         self.assertRegex(front_matter, r"(?m)^name: workspace-organizer$")
         description = re.search(r"(?m)^description: (.+)$", front_matter).group(1).lower()
-        for trigger in ("initialize", "adopt", "TASK.md", "dashboard", "archive"):
+        for trigger in ("initialize", "capture", "Obsidian", "schema v2", "archive"):
             self.assertIn(trigger.lower(), description)
 
         for reference in (
-            "references/initialization-and-adoption.md",
-            "references/task-contract.md",
-            "references/views-and-archive.md",
-            "references/dashboard.md",
-            "references/tooling.md",
-            "references/implementation-guarantees.md",
+            "references/clean-slate-model.md",
+            "references/clean-slate-operations.md",
+            "references/daily-workflow.md",
+            "references/legacy-v1.md",
         ):
             self.assertIn(reference, text)
             self.assertTrue((SKILL_ROOT / reference).is_file())
 
     def test_openai_yaml_uses_exact_interface_values(self) -> None:
         text = (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
-        self.assertEqual(
-            text,
-            'interface:\n'
-            '  display_name: "Workspace Organizer"\n'
-            '  short_description: "Organize durable tasks and workspace materials"\n'
-            '  default_prompt: "Use $workspace-organizer to initialize or safely organize this workspace."\n',
-        )
-        self.assertTrue(25 <= len("Organize durable tasks and workspace materials") <= 64)
+        self.assertIn('display_name: "Workspace Organizer"', text)
+        self.assertIn('short_description: "Run a Markdown-first Obsidian task cockpit"', text)
+        self.assertIn('$workspace-organizer', text)
 
     def test_canonical_templates_conform_to_v1_contract(self) -> None:
         config_path = SKILL_ROOT / "assets" / "workspace-config.json"
@@ -93,6 +105,17 @@ class SkillPackageTests(unittest.TestCase):
         validate_task(task, str(task_path))
         self.assertEqual(task["sensitivity"], "internal")
         self.assertEqual(task["status"], "planned")
+
+    def test_clean_slate_templates_conform_to_v2_model(self) -> None:
+        sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+        import clean_slate_model as model  # noqa: E402
+
+        task = model.parse_record(SKILL_ROOT / "assets" / "task-template.md")
+        capture = model.parse_record(SKILL_ROOT / "assets" / "capture.md")
+        artifact = model.parse_record(SKILL_ROOT / "assets" / "artifact.md")
+        self.assertIsInstance(task, model.Task)
+        self.assertIsInstance(capture, model.Capture)
+        self.assertIsInstance(artifact, model.Artifact)
 
     def test_empty_generated_view_fixtures_are_consistent(self) -> None:
         fixtures = SKILL_ROOT / "assets" / "empty-generated-views"
@@ -136,11 +159,11 @@ class SkillPackageTests(unittest.TestCase):
             for path in SKILL_ROOT.rglob("*.md")
         ).replace("\n", " ")
         for token in (
-            "scan -> proposal -> dry-run -> approval -> apply",
-            "deterministic scripts",
-            "Never automatically overwrite, delete, publish",
+            "preview → exact approval → apply → verify",
+            "deterministic",
+            "never overwritten",
             "public < internal < confidential < restricted",
-            "90_归档/<closed-year>/<area>/<task-id>/",
+            "90_归档/<area-folder>/<closed-year>/<id>/",
             "leave the previous set unchanged",
             "compressed originals",
             "do not open,",

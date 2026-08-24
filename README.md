@@ -1,17 +1,19 @@
 # workspace-organizer-skill
 
-Human- and agent-friendly organization for durable tasks, materials, local
-TODO/timeline views, and verified archives. The v1 workflow is deliberately
-conservative: inspect first, dry-run every structural plan, approve the exact
-plan bytes, then apply and verify. It never overwrites or deletes user content
-by default.
+Clean-slate hybrid workspace management for Obsidian and Chat/Agent. A Task is
+an independently deliverable outcome; Captures and file Artifacts remain separate
+until a deliberate triage decision. Canonical state is human-readable Markdown,
+generated pages are disposable projections, and archive/restore operations are
+audited and recoverable.
 
-中文简介：面向人和智能体的持久工作区整理技能，用规范化任务记录生成本地 TODO、
-时间线和材料索引。v1 坚持先检查、再试运行、精确批准计划、执行并验证；默认不覆盖、
-不删除用户内容。
+中文简介：这是面向 Obsidian 与 Chat/Agent 的 clean-slate 混合式工作区管理技能。
+Task 表示一个可交付结果，Capture 与文件 Artifact 在明确分拣前保持独立；Markdown
+是唯一事实来源，视图可以重建，归档和恢复必须经过可审计的精确批准。
 
 - [English installation and user guide](docs/guide.en.md)
 - [中文安装与使用指南](docs/guide.zh-CN.md)
+- [Clean-slate English user guide](docs/guide.clean-slate.en.md)
+- [Clean-slate 中文用户指南](docs/guide.clean-slate.zh-CN.md)
 - [Clean-slate 混合式设计合同（当前设计基线）](docs/design-contract.zh-CN.md)
 - [Normative v1 workspace model](docs/workspace-model.md)
 - [Auditable distribution-readiness checklist](docs/distribution-readiness.md)
@@ -26,10 +28,6 @@ python3 scripts/run_release_gate.py
 ```
 
 This repository does not tag, publish, or release anything as part of the gate.
-The v1 skill remains fully usable without dashboard assets. The optional v2
-dashboard is a deterministic, read-only local projection over the same
-sensitivity-filtered generated data; it never becomes task authority.
-
-> 设计方向说明：下一版将按 [clean-slate 设计合同](docs/design-contract.zh-CN.md)
-> 重新实现。Obsidian 作为日常驾驶舱，Chat/Agent 作为操作层，Markdown 是
-> 唯一事实来源；当前 v1 文档和测试暂作为历史参考，后续会随新实现整体重写。
+The clean-slate CLI is dependency-free and works with Obsidian closed. The old
+v1 CLI/dashboard files remain only as explicit historical reference; new work
+must use `skill/workspace-organizer/scripts/clean_slate.py` and schema v2.

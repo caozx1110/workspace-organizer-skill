@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "business_statuses": ["planned", "active", "waiting", "blocked", "completed", "cancelled"],
+  "storage_states": ["active", "archived"],
+  "open_statuses": ["planned", "active", "waiting", "blocked"],
+  "closed_statuses": ["completed", "cancelled"],
+  "transitions": {
+    "planned": ["active", "cancelled"],
+    "active": ["waiting", "blocked", "completed", "cancelled"],
+    "waiting": ["active", "blocked", "completed", "cancelled"],
+    "blocked": ["active", "waiting", "completed", "cancelled"],
+    "completed": ["active"],
+    "cancelled": ["planned", "active"]
+  },
+  "archive": {
+    "eligible_statuses": ["completed", "cancelled"],
+    "from_storage_state": "active",
+    "destination": "90_归档/<area-folder>/<closed-year>/<task-id>",
+    "changes_only": ["storage_state", "archived_at", "updated_at"]
+  },
+  "restore": {
+    "from_storage_state": "archived",
+    "to_storage_state": "active",
+    "preserves_business_status": true
+  }
+}

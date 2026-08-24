@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/caozx1110/workspace-organizer-skill/schemas/artifact-v2.schema.json",
+  "title": "workspace-organizer clean-slate Artifact record v2",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["kind", "schema_version", "artifact_id", "payload_path", "owner_task", "role", "sensitivity", "provenance", "sha256", "derived_from", "created_at"],
+  "properties": {
+    "kind": {"const": "artifact"},
+    "schema_version": {"const": 2},
+    "artifact_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "payload_path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000).+$"},
+    "owner_task": {"oneOf": [{"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"}, {"type": "null"}]},
+    "role": {"enum": ["input", "work", "deliverable", "record", "history", "library", "inbox"]},
+    "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "provenance": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "object", "additionalProperties": true}]},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "derived_from": {"oneOf": [{"type": "null"}, {"type": "string"}, {"type": "array", "uniqueItems": true, "items": {"type": "string"}}]},
+    "created_at": {"$ref": "#/$defs/timestamp"},
+    "updated_at": {"$ref": "#/$defs/timestamp"}
+  },
+  "allOf": [
+    {"if": {"properties": {"role": {"enum": ["input", "work", "deliverable", "record", "history"]}}}, "then": {"properties": {"owner_task": {"type": "string"}}}},
+    {"if": {"properties": {"role": {"enum": ["library", "inbox"]}}}, "then": {"properties": {"owner_task": {"type": "null"}}}}
+  ],
+  "$defs": {
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"}
+  }
+}

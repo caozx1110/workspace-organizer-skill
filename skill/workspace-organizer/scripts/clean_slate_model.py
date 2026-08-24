@@ -1039,11 +1039,14 @@ def validate_capture(data: Mapping[str, Any], context: str = "capture") -> None:
     if status == "triaged":
         if normalized["triaged_at"] is None or normalized["disposition"] is None:
             raise ValidationError(f"{context}: triaged capture requires triaged_at and disposition")
-    else:
+    elif status == "deferred":
         if normalized["triaged_at"] is not None:
-            raise ValidationError(f"{context}.triaged_at: only set after triage")
-        if normalized["disposition"] is not None:
-            raise ValidationError(f"{context}.disposition: only set after triage")
+            raise ValidationError(f"{context}.triaged_at: deferred captures are not fully triaged")
+        if normalized["disposition"] not in {None, "defer"}:
+            raise ValidationError(f"{context}.disposition: deferred captures require defer")
+    else:
+        if normalized["triaged_at"] is not None or normalized["disposition"] is not None:
+            raise ValidationError(f"{context}: inbox captures cannot contain triage results")
     disposition = normalized["disposition"]
     if disposition is not None:
         _validate_choice(disposition, CAPTURE_DISPOSITIONS, f"{context}.disposition")

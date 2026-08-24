@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/caozx1110/workspace-organizer-skill/schemas/task-v2.schema.json",
+  "title": "workspace-organizer clean-slate Task note v2",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["kind", "schema_version", "id", "title", "outcome", "status", "storage_state", "area", "type", "priority", "scheduled_on", "due_on", "next_action", "waiting_on", "follow_up_on", "sensitivity", "created_at", "updated_at", "started_at", "closed_at", "archived_at", "closure_summary", "tags", "aliases"],
+  "properties": {
+    "kind": {"const": "task"},
+    "schema_version": {"const": 2},
+    "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 128},
+    "title": {"type": "string", "minLength": 1, "maxLength": 240, "pattern": "^[^\\r\\n]+$"},
+    "outcome": {"type": "string", "minLength": 1, "maxLength": 1000, "pattern": "^[^\\r\\n]+$"},
+    "status": {"enum": ["planned", "active", "waiting", "blocked", "completed", "cancelled"]},
+    "storage_state": {"enum": ["active", "archived"]},
+    "area": {"$ref": "#/$defs/slug"},
+    "type": {"$ref": "#/$defs/slug"},
+    "priority": {"enum": ["urgent", "high", "normal", "low"]},
+    "scheduled_on": {"$ref": "#/$defs/dateOrNull"},
+    "due_on": {"$ref": "#/$defs/dateOrNull"},
+    "next_action": {"$ref": "#/$defs/textOrNull"},
+    "waiting_on": {"$ref": "#/$defs/textOrNull"},
+    "follow_up_on": {"$ref": "#/$defs/dateOrNull"},
+    "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "created_at": {"$ref": "#/$defs/timestamp"},
+    "updated_at": {"$ref": "#/$defs/timestamp"},
+    "started_at": {"$ref": "#/$defs/timestampOrNull"},
+    "closed_at": {"$ref": "#/$defs/timestampOrNull"},
+    "archived_at": {"$ref": "#/$defs/timestampOrNull"},
+    "closure_summary": {"$ref": "#/$defs/textOrNull"},
+    "tags": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+    "aliases": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 240}}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"enum": ["planned", "active", "waiting", "blocked"]}}}, "then": {"properties": {"storage_state": {"const": "active"}, "next_action": {"type": "string", "minLength": 1}, "closed_at": {"type": "null"}, "archived_at": {"type": "null"}, "closure_summary": {"type": "null"}}}},
+    {"if": {"properties": {"status": {"enum": ["completed", "cancelled"]}}}, "then": {"required": ["closed_at", "closure_summary"], "properties": {"next_action": {"type": "null"}}}},
+    {"if": {"properties": {"storage_state": {"const": "archived"}}}, "then": {"properties": {"status": {"enum": ["completed", "cancelled"]}, "archived_at": {"$ref": "#/$defs/timestamp"}}}}
+  ],
+  "$defs": {
+    "slug": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 64},
+    "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "format": "date"},
+    "dateOrNull": {"oneOf": [{"$ref": "#/$defs/date"}, {"type": "null"}]},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "timestampOrNull": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]},
+    "textOrNull": {"oneOf": [{"type": "string", "minLength": 1, "pattern": "^[^\\r\\n]+$"}, {"type": "null"}]}
+  }
+}

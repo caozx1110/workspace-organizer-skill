@@ -59,6 +59,9 @@ _MARKER_RE = re.compile(
 )
 _ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 _PATH_BAD_RE = re.compile(r"(?:^|/)\.\.?(?:/|$)")
 
 
@@ -164,6 +167,23 @@ def _date(value: Any, field: str) -> Optional[str]:
     return value
 
 
+def _timestamp(value: Any, field: str) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ViewError(f"{field}: datetime must be timezone-aware")
+        value = value.isoformat(timespec="seconds")
+    if not isinstance(value, str) or not _TIMESTAMP_RE.fullmatch(value):
+        raise ViewError(f"{field}: must be RFC3339 timestamp")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ViewError(f"{field}: invalid timestamp") from exc
+    return value
+
+
 def _sensitivity(value: Any, field: str = "sensitivity") -> str:
     if value not in SENSITIVITY_RANK:
         raise ViewError(f"{field}: unknown sensitivity")
@@ -234,9 +254,10 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
         storage_state = "archived" if status == "archived" else "active"
     if storage_state not in {"active", "archived"}:
         raise ViewError(f"task {task_id}: unknown storage_state")
+    archived_at = _timestamp(raw.get("archived_at"), f"task {task_id}.archived_at")
     if status in OPEN_STATUSES and storage_state != "active":
         raise ViewError(f"task {task_id}: open task cannot be archived")
-    if status in CLOSED_STATUSES and storage_state == "archived" and raw.get("archived_at") is None:
+    if status in CLOSED_STATUSES and storage_state == "archived" and archived_at is None:
         raise ViewError(f"task {task_id}: archived task requires archived_at")
     title = _text(raw.get("title", raw.get("name")), f"task {task_id}.title", required=True, maximum=300)
     area = _text(raw.get("area"), f"task {task_id}.area", required=True, maximum=128)
@@ -255,17 +276,13 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
     next_action = _text(raw.get("next_action"), f"task {task_id}.next_action", maximum=1000)
     waiting_on = _text(raw.get("waiting_on"), f"task {task_id}.waiting_on", maximum=300)
     closure_summary = _text(raw.get("closure_summary"), f"task {task_id}.closure_summary", maximum=2000)
-    closed_at = raw.get("closed_at")
-    if isinstance(closed_at, (date, datetime)):
-        closed_at = closed_at.isoformat()
-    elif closed_at is not None:
-        closed_at = _text(closed_at, f"task {task_id}.closed_at", maximum=128)
+    closed_at = _timestamp(raw.get("closed_at"), f"task {task_id}.closed_at")
     record_path = _record_path(raw, archived=(storage_state == "archived" or status == "archived"))
     if PurePosixPath(record_path).stem != task_id:
         raise ViewError(f"task {task_id}: canonical note filename must equal task id")
     if status in OPEN_STATUSES and not next_action:
         raise ViewError(f"task {task_id}: open task requires next_action")
-    if status in OPEN_STATUSES and (closed_at is not None or closure_summary is not None or raw.get("archived_at") is not None):
+    if status in OPEN_STATUSES and (closed_at is not None or closure_summary is not None or archived_at is not None):
         raise ViewError(f"task {task_id}: open task has closure metadata")
     if status in CLOSED_STATUSES:
         if not closed_at:
@@ -274,7 +291,7 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
             raise ViewError(f"task {task_id}: closed task requires closure_summary")
         if next_action is not None:
             raise ViewError(f"task {task_id}: closed task next_action must be null")
-        if storage_state == "active" and raw.get("archived_at") is not None:
+        if storage_state == "active" and archived_at is not None:
             raise ViewError(f"task {task_id}: active task has archived_at")
     result = dict(raw)
     result.update(
@@ -827,6 +844,24 @@ def _workspace_today(root: Path, now: Any) -> Any:
     return date.today()
 
 
+def _focus_from_user_file(root: Path) -> tuple[str, ...]:
+    """Read only stable Task IDs from the user-owned FOCUS.md page."""
+
+    path = root / "01_导航" / "FOCUS.md"
+    if path.is_symlink() or not path.is_file():
+        return ()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ()
+    values: list[str] = []
+    for match in re.finditer(r"\[\[20_任务/([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:[|#\]])", text):
+        value = match.group(1)
+        if value not in values:
+            values.append(value)
+    return tuple(values[:3])
+
+
 def _iter_markdown_files(base: Path) -> Iterable[Path]:
     """Yield Markdown files without crossing symlink or nested-Git boundaries."""
 
@@ -914,6 +949,7 @@ def generate_views(
 
     root_path = Path(root)
     records = collect_records(root_path)
+    selected_focus = tuple(focus_ids) if focus_ids else _focus_from_user_file(root_path)
     config = _config_data(root_path)
     effective_profile = profile
     if profile is None:
@@ -923,7 +959,7 @@ def generate_views(
         records["captures"],
         now=_workspace_today(root_path, now),
         profile=effective_profile,
-        focus_ids=focus_ids,
+        focus_ids=selected_focus,
         area_labels=_config_area_labels(root_path),
     )
     receipt = write_views(root_path, bundle)

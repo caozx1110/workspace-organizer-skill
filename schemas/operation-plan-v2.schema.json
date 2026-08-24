@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/caozx1110/workspace-organizer-skill/schemas/operation-plan-v2.schema.json",
+  "title": "workspace-organizer clean-slate operation plan v2",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "operation", "operation_id", "workspace_id", "created_at", "plan_digest"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "operation": {"enum": ["triage", "archive", "restore", "init", "attach", "move"]},
+    "operation_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "workspace_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+    "created_at": {"type": "string"},
+    "plan_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {"$ref": "#/$defs/path"},
+    "destination": {"$ref": "#/$defs/path"},
+    "source_snapshot": {"type": "array"},
+    "task_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "capture_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\\u0000).+$"}
+  }
+}
