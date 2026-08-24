@@ -7,7 +7,7 @@ the only source of truth. Most days you need only a handful of pages.
 
 1. Open `01_导航/HOME.md`, then `00_总览/TODAY.md`.
 2. Keep one to three task links in the user-owned `01_导航/FOCUS.md`.
-3. Act on the `Next` lines in TODAY; open `NEXT.md` only for the complete queue.
+3. Act on the Chinese `下一步` lines in TODAY; open `NEXT.md` only for the complete queue.
 4. Check `WAITING.md` for external dependencies and `INBOX.md` for a small batch of new input.
 5. Explicitly complete/cancel outcomes with a result in the evening; update the next action for unfinished work.
 
@@ -20,6 +20,12 @@ the only source of truth. Most days you need only a handful of pages.
 | `INBOX.md` | generator | untriaged Captures |
 | `WAITING.md` | generator | waiting/blocked work and follow-ups |
 | `ARCHIVE_INDEX.md` | generator | readable navigation of closed bundles |
+
+New Task defaults and the five generated views are Chinese-first. The views use
+native Obsidian callouts and require no custom CSS or theme. Stable frontmatter
+keys, enum values, Task IDs, and directory names remain English for tooling;
+the presentation layer translates values such as `active` and `high` into
+Chinese labels.
 
 ## CLI examples
 

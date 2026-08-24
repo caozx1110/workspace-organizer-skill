@@ -1146,7 +1146,7 @@ def _task_fields(args: argparse.Namespace, config: Mapping[str, Any], task_id: s
     now = _now(config)
     title = args.title.strip()
     outcome = (args.outcome or title).strip()
-    next_action = args.next_action if args.next_action is not None else "Define the first next action"
+    next_action = args.next_action if args.next_action is not None else "确定第一个可执行的下一步"
     configured_areas = {str(item.get("key")) for item in config.get("areas", []) if isinstance(item, Mapping)}
     if args.area not in configured_areas:
         raise _error(f"unknown area key: {args.area}")
@@ -1372,7 +1372,7 @@ def _transition(args: argparse.Namespace, target: str) -> Dict[str, Any]:
             raise _error("closing a task requires --summary")
         kwargs["closure_summary"] = args.summary
     if target == "active" and task.fields["status"] in {"completed", "cancelled"}:
-        kwargs["next_action"] = args.next_action or "Define the next action"
+        kwargs["next_action"] = args.next_action or "确定下一个可执行动作"
     if target == "waiting":
         kwargs["waiting_on"] = args.waiting_on
         kwargs["follow_up_on"] = _parse_optional_field(args.follow_up_on)
@@ -1702,7 +1702,7 @@ def _triage_plan(args: argparse.Namespace) -> Dict[str, Any]:
             "priority": args.priority or "normal",
             "scheduled_on": None,
             "due_on": args.due_on,
-            "next_action": args.next_action or "Review the captured input",
+            "next_action": args.next_action or "查看已捕获的内容并确定下一步",
             "waiting_on": None,
             "follow_up_on": None,
             "sensitivity": capture.fields["sensitivity"],

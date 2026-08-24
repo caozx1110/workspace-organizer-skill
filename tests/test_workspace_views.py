@@ -106,6 +106,35 @@ class ViewRenderingTests(unittest.TestCase):
         self.assertNotIn("done", bundle["files"]["00_总览/NEXT.md"].decode("utf-8"))
         self.assertIn("c", bundle["files"]["00_总览/INBOX.md"].decode("utf-8"))
 
+    def test_generated_views_are_chinese_first_obsidian_cards(self):
+        tasks = [
+            task("work", title="整理合同", status="planned", priority="high", due_on="2026-08-26", next_action="确认付款条款"),
+            task("wait", title="等待审批", status="waiting", waiting_on="财务", follow_up_on="2026-08-24"),
+        ]
+        bundle = views.build_views(tasks, [capture("mail", title="供应商邮件")], now="2026-08-24")
+        today = bundle["files"]["00_总览/TODAY.md"].decode("utf-8")
+        waiting = bundle["files"]["00_总览/WAITING.md"].decode("utf-8")
+        inbox = bundle["files"]["00_总览/INBOX.md"].decode("utf-8")
+
+        self.assertIn("# 今日驾驶舱", today)
+        self.assertIn("> [!summary] 今日概览", today)
+        self.assertIn("> [!todo] [整理合同]", today)
+        self.assertIn("**下一步**：确认付款条款", today)
+        self.assertIn("`计划中` · `高优先级` · 📅 截止 2026-08-26", today)
+        self.assertIn("# 等待与跟进", waiting)
+        self.assertIn("**等待对象**：财务", waiting)
+        self.assertIn("**跟进日期**：2026-08-24", waiting)
+        self.assertIn("# 待分拣收件箱", inbox)
+        for legacy_ui in ("Next actions", "Waiting follow-up", "Inbox is clear", "_None._"):
+            self.assertNotIn(legacy_ui, today)
+
+    def test_empty_views_use_concise_chinese_states(self):
+        bundle = views.build_views([], now="2026-08-24")
+        self.assertIn("收件箱已清空", bundle["files"]["00_总览/TODAY.md"].decode("utf-8"))
+        self.assertIn("没有开放任务", bundle["files"]["00_总览/NEXT.md"].decode("utf-8"))
+        self.assertIn("目前没有等待或阻塞中的任务", bundle["files"]["00_总览/WAITING.md"].decode("utf-8"))
+        self.assertIn("还没有已归档任务", bundle["files"]["00_总览/ARCHIVE_INDEX.md"].decode("utf-8"))
+
     def test_write_is_idempotent_and_refuses_unmarked_user_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
