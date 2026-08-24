@@ -392,6 +392,32 @@ def _validate_ordered_timestamps(data: Mapping[str, Any], context: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _json_loads_safe(value: str, context: str) -> Any:
+    """Decode JSON while rejecting duplicate object keys and non-finite nums."""
+
+    def pairs(items: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, item in items:
+            if key in result:
+                raise FrontmatterError(f"{context}: duplicate flow-map key {key!r}")
+            result[key] = item
+        return result
+
+    def reject_constant(token: str) -> Any:
+        raise FrontmatterError(f"{context}: non-finite JSON number {token!r} is not allowed")
+
+    try:
+        return json.loads(
+            value,
+            object_pairs_hook=pairs,
+            parse_constant=reject_constant,
+        )
+    except FrontmatterError:
+        raise
+    except json.JSONDecodeError:
+        raise
+
+
 def _split_lines(text: str) -> Tuple[List[str], str]:
     """Return lines including endings and the dominant line ending."""
 
@@ -423,7 +449,7 @@ def _parse_flow_or_scalar(raw: str, context: str) -> Any:
         return False
     if value.startswith("[") or value.startswith("{"):
         try:
-            return json.loads(value)
+            return _json_loads_safe(value, context)
         except json.JSONDecodeError:
             # A small fallback for ordinary YAML flow lists (single quotes or
             # unquoted slugs), while still refusing arbitrary object syntax.
@@ -457,7 +483,7 @@ def _parse_flow_or_scalar(raw: str, context: str) -> Any:
     if value.startswith(("\"", "'")):
         if value.startswith('"'):
             try:
-                parsed = json.loads(value)
+                parsed = _json_loads_safe(value, context)
             except json.JSONDecodeError as exc:
                 raise FrontmatterError(f"{context}: invalid quoted string") from exc
             if not isinstance(parsed, str):
@@ -1233,6 +1259,8 @@ def transition_task(
     _require_advance(data.get("updated_at"), timestamp, f"task {data['id']}")
     data["status"] = target_status
     data["updated_at"] = timestamp
+    if target_status == "active" and old_status == "planned" and data.get("started_at") is None:
+        data["started_at"] = timestamp
     if target_status in CLOSED_STATUSES:
         summary = closure_summary
         if summary is None:
