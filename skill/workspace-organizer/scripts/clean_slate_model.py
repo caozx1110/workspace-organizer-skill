@@ -1234,7 +1234,7 @@ def transition_task(
     next_action: Optional[str] = None,
     waiting_on: Any = None,
     follow_up_on: Any = None,
-) -> Union[Dict[str, Any], Task]:
+) -> Dict[str, Any]:
     """Return a validated copy of *task* after a legal status transition.
 
     ``target_status`` never accepts ``archived``; use :func:`archive_task` for
@@ -1307,14 +1307,14 @@ def transition_task(
         elif old_status in {"waiting", "blocked"}:
             data["follow_up_on"] = None
     validate_task(data)
-    return Task(data, task.body) if isinstance(task, Task) else data
+    return data
 
 
 def archive_task(
     task: Union[Task, Mapping[str, Any]],
     *,
     now: Optional[Union[str, datetime]] = None,
-) -> Union[Dict[str, Any], Task]:
+) -> Dict[str, Any]:
     """Mark a closed active task as archived (without changing business status)."""
 
     data = copy.deepcopy(task.fields if isinstance(task, MarkdownRecord) else dict(task))
@@ -1329,14 +1329,14 @@ def archive_task(
     data["archived_at"] = timestamp
     data["updated_at"] = timestamp
     validate_task(data)
-    return Task(data, task.body) if isinstance(task, Task) else data
+    return data
 
 
 def restore_task(
     task: Union[Task, Mapping[str, Any]],
     *,
     now: Optional[Union[str, datetime]] = None,
-) -> Union[Dict[str, Any], Task]:
+) -> Dict[str, Any]:
     """Restore an archived task to active storage while preserving closure state."""
 
     data = copy.deepcopy(task.fields if isinstance(task, MarkdownRecord) else dict(task))
@@ -1349,7 +1349,7 @@ def restore_task(
     data["archived_at"] = None
     data["updated_at"] = timestamp
     validate_task(data)
-    return Task(data, task.body) if isinstance(task, Task) else data
+    return data
 
 
 # ---------------------------------------------------------------------------
