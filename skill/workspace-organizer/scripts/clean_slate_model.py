@@ -981,9 +981,14 @@ def validate_capture(data: Mapping[str, Any], context: str = "capture") -> None:
     _single_line(normalized["title"], f"{context}.title", maximum=240)
     status = _validate_choice(normalized["status"], CAPTURE_STATUSES, f"{context}.status")
     _validate_choice(normalized["capture_type"], CAPTURE_TYPES, f"{context}.capture_type")
-    if normalized["payload_path"] is None:
-        raise ValidationError(f"{context}.payload_path: required for an artifact")
+    # Text/link/email captures keep their original content in the Capture note
+    # body and therefore do not need a separate payload.  A file capture must
+    # point at the copied, workspace-relative source bytes; all other capture
+    # types may either omit the payload or provide one when an integration has
+    # materialized it.
     _validate_relative_path_or_null(normalized["payload_path"], f"{context}.payload_path")
+    if normalized["capture_type"] == "file" and normalized["payload_path"] is None:
+        raise ValidationError(f"{context}.payload_path: required for file captures")
     source = normalized["source"]
     if not isinstance(source, (str, Mapping)):
         raise ValidationError(f"{context}.source: must be text or a mapping")
