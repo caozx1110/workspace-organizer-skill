@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/caozx1110/workspace-organizer-skill/schemas/workspace-config-v2.schema.json",
+  "title": "workspace-organizer clean-slate workspace config v2",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["kind", "schema_version", "workspace_id", "timezone", "default_sensitivity", "view_max_sensitivity", "areas"],
+  "properties": {
+    "kind": {"const": "workspace-config"},
+    "schema_version": {"const": 2},
+    "workspace_id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 64},
+    "timezone": {"type": "string", "minLength": 1, "maxLength": 128},
+    "default_sensitivity": {"$ref": "#/$defs/sensitivity"},
+    "view_max_sensitivity": {"$ref": "#/$defs/sensitivity"},
+    "areas": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/area"}}
+  },
+  "$defs": {
+    "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "area": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "label", "archive_folder"],
+      "properties": {
+        "key": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+        "label": {"type": "string", "minLength": 1, "pattern": "^[^\\r\\n]+$"},
+        "archive_folder": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\.]+$"}
+      }
+    }
+  }
+}

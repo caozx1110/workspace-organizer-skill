@@ -76,6 +76,18 @@ def run_gate(repo_root: Path, skill_creator_root: Optional[Path]) -> dict:
                 ],
             ),
             (
+                "clean-slate-model-view-cli-tests",
+                [
+                    python,
+                    "-m",
+                    "unittest",
+                    "-v",
+                    "tests/test_clean_slate_model.py",
+                    "tests/test_workspace_views.py",
+                    "tests/test_clean_slate_cli.py",
+                ],
+            ),
+            (
                 "scenario-matrix-tests",
                 [python, "-m", "unittest", "-v", "tests/test_workspace_scenarios.py"],
             ),
@@ -95,6 +107,10 @@ def run_gate(repo_root: Path, skill_creator_root: Optional[Path]) -> dict:
             (
                 "isolated-distribution-forward-test",
                 [python, "scripts/forward_test_distribution.py"],
+            ),
+            (
+                "isolated-clean-slate-forward-test",
+                [python, "scripts/forward_test_clean_slate.py"],
             ),
         ]
     )

@@ -1,4 +1,4 @@
 interface:
   display_name: "Workspace Organizer"
-  short_description: "Organize durable tasks and workspace materials"
-  default_prompt: "Use $workspace-organizer to initialize or safely organize this workspace."
+  short_description: "Run a Markdown-first Obsidian task cockpit"
+  default_prompt: "Use $workspace-organizer to capture today's work and show my safe next actions."
