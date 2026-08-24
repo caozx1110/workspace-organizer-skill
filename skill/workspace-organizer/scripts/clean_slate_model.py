@@ -216,6 +216,10 @@ def sha256_file(path: Union[str, Path]) -> str:
 
     digest = hashlib.sha256()
     target = Path(path)
+    if target.is_symlink():
+        raise ModelError(f"{target}: symlink payloads are not trusted")
+    if not target.is_file():
+        raise ModelError(f"{target}: expected a regular file")
     with target.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
