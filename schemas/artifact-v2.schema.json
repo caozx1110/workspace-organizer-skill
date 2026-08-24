@@ -13,6 +13,7 @@
     "owner_task": {"oneOf": [{"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"}, {"type": "null"}]},
     "role": {"enum": ["input", "work", "deliverable", "record", "history", "library", "inbox"]},
     "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "agent_access": {"enum": ["none", "metadata", "content"], "default": "none"},
     "provenance": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "object", "additionalProperties": true}]},
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "derived_from": {"oneOf": [{"type": "null"}, {"type": "string"}, {"type": "array", "uniqueItems": true, "items": {"type": "string"}}]},

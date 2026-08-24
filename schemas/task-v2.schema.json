@@ -22,6 +22,7 @@
     "waiting_on": {"$ref": "#/$defs/textOrNull"},
     "follow_up_on": {"$ref": "#/$defs/dateOrNull"},
     "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "agent_access": {"enum": ["none", "metadata", "content"], "default": "metadata"},
     "created_at": {"$ref": "#/$defs/timestamp"},
     "updated_at": {"$ref": "#/$defs/timestamp"},
     "started_at": {"$ref": "#/$defs/timestampOrNull"},

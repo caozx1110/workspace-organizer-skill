@@ -5,10 +5,12 @@ structural/risk operation.
 
 ## Permission classes
 
-Read-only queries, validation, and view regeneration may run directly with the
-configured sensitivity profile. Clear, unique semantic edits such as title,
-priority, dates, next action, or an explicitly requested close may run with
-expected-digest CAS and return a receipt.
+Read-only metadata queries, validation, and private cockpit regeneration may run
+directly within each record's `agent_access`. Clear, unique semantic edits such
+as title, priority, dates, next action, or an explicitly requested close require
+at least `metadata`, expected-digest CAS, and a receipt. Body reads require Task
+`content`; payload reads require Artifact `content`. Raising access is an
+explicit human authorization.
 
 Inbox triage, payload copy/move/rename, owner or role changes, archive/restore,
 deletion, lowering sensitivity, and any external transfer require:
@@ -24,7 +26,8 @@ source invalidates approval. Never reuse a vague “yes” for another operation
 ## CLI route
 
 Use `scripts/clean_slate.py`. Main routes include workspace initialization,
-Task CRUD/lifecycle, Capture creation/triage, view generation, and archive
+Task CRUD/lifecycle, Capture creation/triage, Artifact inspection, private view
+generation, explicit filtered export, and archive
 planning/application. Every command emits a JSON receipt or a fail-closed error;
 Obsidian is optional.
 
@@ -38,8 +41,9 @@ new plan. Never guess whether a partial move succeeded.
 - Store only Unicode-NFC workspace-relative POSIX paths.
 - Reject absolute paths, `.`/`..`, backslashes, normalized sibling collisions,
   symlink components, and nested Git boundaries.
-- Filter sensitivity before reading content into model context and before
-  rendering, counting, sorting, hashing a view, or emitting shared logs.
+- For share/export, filter sensitivity before reading content into model context
+  and before rendering, counting, sorting, hashing, or emitting shared logs.
+  The local cockpit is not a share projection and includes `restricted` records.
 - Generated views are all-or-none and replace only a valid marker for the same
   view; generation failure leaves the previous set intact.
 - A close never moves a bundle. Archive accepts only closed tasks with a closure

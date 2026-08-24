@@ -65,6 +65,25 @@ and export each create a new Artifact with `derived_from` and tool/version
 evidence. Copy and hash by default; deleting the original needs a separate
 explicit instruction.
 
+## Disclosure and Agent access
+
+Do not derive Agent access from sensitivity. `sensitivity` is the disclosure
+risk (`public` through `restricted`); `agent_access` is the current capability
+(`none`, `metadata`, `content`). Task, Capture, body and Artifact payload are
+separate boundaries. Missing v2 access fields use least-privilege migration
+defaults (`metadata` for Task/Capture, `none` for Artifact); unknown values fail
+closed. Increasing access is a human authorization, not a semantic Agent edit.
+
+The local cockpit is private and complete through `restricted`. A share/export
+projection has an explicit sensitivity ceiling and filters before counts,
+ordering, digest generation or rendering.
+
+Sensitivity is explicit metadata chosen by the human or an accepted workspace
+rule, not a confidence score inferred from prose. When owner, purpose or
+sensitivity is uncertain, keep the Capture in Inbox and use the conservative
+`restricted` value until a human confirms it. Never derive `agent_access` from
+the sensitivity label.
+
 Effective sensitivity is the most restrictive applicable declaration. Lowering
 sensitivity, publishing, or sending content outside the workspace is a risk
 operation and requires explicit approval.

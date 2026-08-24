@@ -15,6 +15,7 @@ next_action: "确认第一个可执行动作"
 waiting_on: null
 follow_up_on: null
 sensitivity: internal
+agent_access: metadata
 created_at: "2026-08-24T13:55:01+08:00"
 updated_at: "2026-08-24T13:55:01+08:00"
 started_at: null

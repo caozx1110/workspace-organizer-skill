@@ -47,6 +47,27 @@ def task_fields(**overrides):
 
 
 class CleanSlateModelTests(unittest.TestCase):
+    def test_agent_access_defaults_and_unknown_policy_fail_closed(self):
+        task = task_fields()
+        self.assertEqual(model.effective_agent_access(task), "metadata")
+        artifact = {
+            "kind": "artifact",
+            "schema_version": 2,
+            "artifact_id": "artifact-policy",
+            "payload_path": "30_资料库/a.txt",
+            "owner_task": None,
+            "role": "library",
+            "sensitivity": "internal",
+            "provenance": "manual",
+            "sha256": "0" * 64,
+            "derived_from": [],
+            "created_at": "2026-08-24T12:00:00+08:00",
+        }
+        self.assertEqual(model.effective_agent_access(artifact), "none")
+        task["agent_access"] = "unknown"
+        with self.assertRaises(model.ValidationError):
+            model.validate_task(task)
+
     def test_task_round_trip_preserves_unknown_property_and_body(self):
         original = model.render_frontmatter(task_fields(), "\n# 工作记录\n\n正文不应被重排。\n").encode()
         record = model.parse_note_bytes(original)

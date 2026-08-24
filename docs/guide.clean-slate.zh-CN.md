@@ -32,6 +32,7 @@ python3 "$WO" init /path/to/vault --yes
 python3 "$WO" task create /path/to/vault --title "更新护照" --outcome "拿到受理凭证" --yes
 python3 "$WO" capture create /path/to/vault --text "供应商发来合同" --yes
 python3 "$WO" views generate /path/to/vault
+python3 "$WO" views export /path/to/vault --profile internal --output /path/to/share
 ```
 
 Capture 不等于 Task。需要把输入变成任务、挂接文件或放入资料库时，先运行
@@ -45,5 +46,20 @@ Capture 不等于 Task。需要把输入变成任务、挂接文件或放入资�
 因此 Obsidian 在 Agent 读取后保存会产生冲突，而不是被覆盖。生成器只覆盖带有
 自身 marker 的五个总览页；HOME 和 FOCUS 永远保留。
 
-不确定 owner、敏感度、目标或意图时，保持在 Inbox，不让模型猜。默认视图最多
-显示 `internal`，更敏感内容不会出现在标题、路径、计数或排序中。
+不确定 owner、敏感度、目标或意图时，保持在 Inbox，不让模型猜。个人驾驶舱是
+本地自用视图，默认完整显示到 `restricted`。只有显式 `views export` 才按
+`--profile` 先过滤、再计数/排序/渲染；不要把驾驶舱目录直接当作分享产物。
+
+`sensitivity` 表示内容泄露风险，`agent_access` 表示 Agent 访问级别。`none`
+只返回标题为 `[restricted]` 的最小存根；`metadata`（Task/Capture 默认）可排期、
+提醒和更新生命周期，但不能读取正文；`content` 才能配合 `task show --include-body`
+读取正文。Artifact 默认 `none`，即便 Task 是 `content`，附件也必须由自身策略明确
+授予 `content`。提升访问权必须由人类显式执行：
+
+```sh
+python3 "$WO" task update /path/to/vault --task-id ID --agent-access content --authorize-access --actor human
+python3 "$WO" artifact update-access /path/to/vault --artifact-id ID --agent-access content --authorize-access --actor human
+```
+
+敏感度由人类或已确认的工作区规则显式指定，不根据正文关键词自动猜测。owner、
+用途或敏感度不确定时，输入留在 Inbox 并暂按 `restricted`，等待人类确认。

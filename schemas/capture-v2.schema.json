@@ -15,6 +15,7 @@
     "payload_path": {"$ref": "#/$defs/pathOrNull"},
     "source": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "object", "additionalProperties": true}]},
     "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "agent_access": {"enum": ["none", "metadata", "content"], "default": "metadata"},
     "captured_at": {"$ref": "#/$defs/timestamp"},
     "updated_at": {"$ref": "#/$defs/timestamp"},
     "triaged_at": {"$ref": "#/$defs/timestampOrNull"},

@@ -7,6 +7,7 @@ payload_path: "20_任务/20260824T135501-example-task/01_输入/example.pdf"
 owner_task: 20260824T135501-example-task
 role: input
 sensitivity: internal
+agent_access: none
 media_type: application/pdf
 size_bytes: 0
 sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

@@ -9,6 +9,7 @@ views and operation plans are disposable or auditable respectively.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -47,11 +48,12 @@ from clean_slate_model import (
     restore_task,
     sha256_bytes,
     transition_task,
+    effective_agent_access,
     validate_artifact,
     validate_capture,
     validate_task,
 )
-from workspace_views import ViewError, collect_records, generate_views
+from workspace_views import ViewError, build_views, collect_records, generate_views, write_views
 
 
 ROOT_DIRS = (
@@ -71,6 +73,7 @@ ROLE_DIRS = {
     "record": "04_记录",
 }
 SENSITIVITY_RANK = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
+AGENT_ACCESS_RANK = {"none": 0, "metadata": 1, "content": 2}
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
@@ -503,7 +506,7 @@ def _read_config(root: Path) -> Dict[str, Any]:
             data[key.strip()] = _parse_simple_value(raw)
     if not isinstance(data, dict):
         raise _error("workspace config must be a mapping")
-    required = ("kind", "schema_version", "workspace_id", "timezone", "default_sensitivity", "view_max_sensitivity", "areas")
+    required = ("kind", "schema_version", "workspace_id", "timezone", "default_sensitivity", "areas")
     missing = [key for key in required if key not in data]
     if missing:
         raise _error("workspace config missing: " + ", ".join(missing))
@@ -511,7 +514,7 @@ def _read_config(root: Path) -> Dict[str, Any]:
         raise _error("workspace config must be kind=workspace-config schema_version=2")
     if not isinstance(data["workspace_id"], str) or not SLUG_RE.fullmatch(data["workspace_id"]):
         raise _error("workspace_id must be a lowercase slug")
-    if data["default_sensitivity"] not in SENSITIVITY_RANK or data["view_max_sensitivity"] not in SENSITIVITY_RANK:
+    if data["default_sensitivity"] not in SENSITIVITY_RANK:
         raise _error("workspace sensitivity policy is invalid")
     areas = data["areas"]
     if not isinstance(areas, list):
@@ -578,7 +581,7 @@ def _event(root: Path, receipt: Any) -> None:
     append_event(root / ".workspace-organizer" / "events.jsonl", receipt)
 
 
-def _find_task(root: Path, task_id: str) -> Tuple[Path, Task]:
+def _find_task(root: Path, task_id: str, *, metadata_only: bool = False) -> Tuple[Path, Task]:
     if not ID_RE.fullmatch(task_id):
         raise _error("task id is invalid")
     candidates: List[Path] = []
@@ -590,7 +593,7 @@ def _find_task(root: Path, task_id: str) -> Tuple[Path, Task]:
         if not canonical and not _has_frontmatter_prefix(note):
             continue
         try:
-            record = parse_record(note)
+            record = _parse_record_frontmatter(note) if metadata_only else parse_record(note)
         except Exception as exc:
             if canonical or _has_frontmatter_prefix(note):
                 raise _error(f"{note}: invalid managed task note: {exc}") from exc
@@ -616,7 +619,7 @@ def _all_tasks(root: Path) -> List[Tuple[Path, Task]]:
                 # Ordinary body notes are not records and are left untouched.
                 continue
             try:
-                record = parse_record(note)
+                record = _parse_record_frontmatter(note)
             except Exception as exc:
                 raise _error(f"{note}: invalid managed task note: {exc}") from exc
             if not isinstance(record, Task):
@@ -637,6 +640,26 @@ def _all_tasks(root: Path) -> List[Tuple[Path, Task]]:
     return records
 
 
+def _parse_record_frontmatter(path: Path) -> Any:
+    """Parse only a bounded frontmatter prefix, never the Markdown body."""
+
+    lines: List[bytes] = []
+    total = 0
+    closing = False
+    with path.open("rb") as stream:
+        for line in stream:
+            total += len(line)
+            if total > 1024 * 1024:
+                raise _error(f"{path}: frontmatter exceeds 1 MiB")
+            lines.append(line)
+            if line.rstrip(b"\r\n") == b"---" and len(lines) > 1:
+                closing = True
+                break
+    if not closing:
+        raise _error(f"{path}: missing frontmatter terminator")
+    return parse_record_bytes(b"".join(lines) + b"\n", str(path))
+
+
 def _find_capture(root: Path, capture_id: str) -> Tuple[Path, Capture]:
     if not ID_RE.fullmatch(capture_id):
         raise _error("capture id is invalid")
@@ -653,6 +676,85 @@ def _find_capture(root: Path, capture_id: str) -> Tuple[Path, Capture]:
     if len(matches) != 1:
         raise _error(f"capture {capture_id!r} does not identify exactly one valid capture")
     return matches[0]
+
+
+def _all_artifacts(root: Path) -> List[Tuple[Path, Artifact]]:
+    records: List[Tuple[Path, Artifact]] = []
+    for relative in ("20_任务", "30_资料库", "90_归档"):
+        for path in sorted(_managed_markdown_files(root, relative), key=lambda item: item.as_posix()):
+            if not path.name.endswith(".artifact.md"):
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise _error(f"{path}: artifact record must be a regular file")
+            try:
+                record = parse_record(path)
+            except Exception as exc:
+                raise _error(f"{path}: invalid artifact record: {exc}") from exc
+            if not isinstance(record, Artifact):
+                raise _error(f"{path}: *.artifact.md must have kind=artifact")
+            records.append((path, record))
+    return records
+
+
+def _artifact_projection(path: Path, artifact: Artifact, root: Path, *, include_payload: bool = False) -> Dict[str, Any]:
+    access = _record_agent_access(artifact.fields, "artifact")
+    if include_payload:
+        _require_agent_access(artifact.fields, "content", kind="artifact")
+    item = dict(artifact.fields)
+    item["agent_access"] = access
+    if access == "none":
+        keep = {"kind", "schema_version", "artifact_id", "owner_task", "role", "sensitivity", "agent_access", "created_at"}
+        item = {key: item[key] for key in keep if key in item}
+    else:
+        item["record"] = path.relative_to(root).as_posix()
+        item["sha256"] = artifact.digest
+        if include_payload:
+            payload = root / str(artifact.fields["payload_path"])
+            if payload.is_symlink() or not payload.is_file():
+                raise _error(f"{payload}: artifact payload is unavailable")
+            item["payload_base64"] = base64.b64encode(payload.read_bytes()).decode("ascii")
+    return item
+
+
+def _artifact_list(args: argparse.Namespace) -> Dict[str, Any]:
+    root = _root_path(args.root)
+    items = [_artifact_projection(path, artifact, root) for path, artifact in _all_artifacts(root)]
+    items.sort(key=lambda item: str(item.get("artifact_id", "")))
+    return {"status": "ok", "operation": "artifact.list", "count": len(items), "items": items}
+
+
+def _find_artifact(root: Path, artifact_id: str) -> Tuple[Path, Artifact]:
+    matches = [(path, artifact) for path, artifact in _all_artifacts(root) if artifact.fields.get("artifact_id") == artifact_id]
+    if len(matches) != 1:
+        raise _error(f"artifact {artifact_id!r} does not identify exactly one record")
+    return matches[0]
+
+
+def _artifact_show(args: argparse.Namespace) -> Dict[str, Any]:
+    root = _root_path(args.root)
+    path, artifact = _find_artifact(root, args.artifact_id)
+    return {"status": "ok", "operation": "artifact.show", "artifact": _artifact_projection(path, artifact, root, include_payload=args.include_payload)}
+
+
+def _artifact_update_access(args: argparse.Namespace) -> Dict[str, Any]:
+    root = _root_path(args.root)
+    config = _read_config(root)
+    path, artifact = _find_artifact(root, args.artifact_id)
+    old_access = _record_agent_access(artifact.fields, "artifact")
+    new_access = args.agent_access
+    if AGENT_ACCESS_RANK[new_access] > AGENT_ACCESS_RANK[old_access] and not (args.authorize_access and args.actor == "human"):
+        raise _error("raising agent_access requires --authorize-access with --actor human")
+    result = cas_update_path(
+        path,
+        args.expected_sha or artifact.digest,
+        {"agent_access": new_access},
+        actor=args.actor,
+        event_type="artifact.access.updated",
+        metadata={"record": path.relative_to(root).as_posix(), "from": old_access, "to": new_access},
+        now=_now(config),
+    )
+    _event(root, result.receipt)
+    return {"status": "updated" if result.changed_fields else "unchanged", "operation": "artifact.update-access", "artifact_id": args.artifact_id, "changed_fields": list(result.changed_fields), "sha256": result.after_sha256, "receipt": result.receipt.to_dict()}
 
 
 def _snapshot_tree(root: Path, relative: str) -> List[Dict[str, Any]]:
@@ -983,7 +1085,6 @@ def _init_workspace(args: argparse.Namespace) -> Dict[str, Any]:
         "workspace_id": workspace_id,
         "timezone": timezone_name,
         "default_sensitivity": args.default_sensitivity,
-        "view_max_sensitivity": args.view_max_sensitivity,
         "areas": area_items,
     }
     config_text = "\n".join(
@@ -993,7 +1094,6 @@ def _init_workspace(args: argparse.Namespace) -> Dict[str, Any]:
             f"workspace_id: {workspace_id}",
             f"timezone: {json.dumps(timezone_name, ensure_ascii=False)}",
             f"default_sensitivity: {args.default_sensitivity}",
-            f"view_max_sensitivity: {args.view_max_sensitivity}",
             "areas: " + json.dumps(area_items, ensure_ascii=False, separators=(",", ":")),
             "",
         ]
@@ -1067,6 +1167,7 @@ def _task_fields(args: argparse.Namespace, config: Mapping[str, Any], task_id: s
         "waiting_on": None,
         "follow_up_on": None,
         "sensitivity": args.sensitivity or config["default_sensitivity"],
+        "agent_access": args.agent_access or "metadata",
         "created_at": now,
         "updated_at": now,
         "started_at": now if args.status == "active" else None,
@@ -1135,16 +1236,44 @@ def _create_task(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def _visible_task(record: Task, config: Mapping[str, Any]) -> bool:
-    sensitivity = record.fields.get("sensitivity")
-    return SENSITIVITY_RANK.get(sensitivity, 99) <= SENSITIVITY_RANK[config["view_max_sensitivity"]]
+def _record_agent_access(record: Mapping[str, Any], kind: Optional[str] = None) -> str:
+    try:
+        value = effective_agent_access(record, kind=kind)
+    except ModelError as exc:
+        raise _error(str(exc)) from exc
+    if value not in AGENT_ACCESS_RANK:
+        raise _error("record.agent_access: unknown access policy")
+    return value
+
+
+def _require_agent_access(record: Mapping[str, Any], required: str, *, kind: Optional[str] = None) -> str:
+    actual = _record_agent_access(record, kind)
+    if AGENT_ACCESS_RANK[actual] < AGENT_ACCESS_RANK[required]:
+        raise _error(f"agent access {required!r} is required; record grants {actual!r}")
+    return actual
+
+
+def _task_projection(path: Path, task: Task, root: Path, *, include_body: bool = False) -> Dict[str, Any]:
+    access = _record_agent_access(task.fields, "task")
+    item = dict(task.fields)
+    item["agent_access"] = access
+    if access == "none":
+        keep = {"kind", "schema_version", "id", "status", "storage_state", "area", "type", "priority", "scheduled_on", "due_on", "follow_up_on", "sensitivity", "agent_access"}
+        item = {key: item[key] for key in keep if key in item}
+        item["title"] = "[restricted]"
+    else:
+        item.update(record=path.relative_to(root).as_posix(), sha256=_sha256_file(path))
+    if include_body:
+        _require_agent_access(task.fields, "content", kind="task")
+        item["body"] = task.body
+    return item
 
 
 def _task_list(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     records = _all_tasks(root)
-    visible = [(path, task) for path, task in records if _visible_task(task, config)]
+    visible = records
     if args.status:
         visible = [(path, task) for path, task in visible if task.fields["status"] == args.status]
     if args.area:
@@ -1153,23 +1282,15 @@ def _task_list(args: argparse.Namespace) -> Dict[str, Any]:
         visible = [(path, task) for path, task in visible if task.fields["status"] in {"planned", "active", "waiting", "blocked"} and task.fields["storage_state"] == "active"]
     items = []
     for path, task in sorted(visible, key=lambda item: (str(item[1].fields.get("due_on") or "9999-12-31"), str(item[1].fields.get("priority")), item[1].fields["id"])):
-        item = dict(task.fields)
-        item["record"] = path.relative_to(root).as_posix()
-        item["sha256"] = task.digest
+        item = _task_projection(path, task, root)
         items.append(item)
     return {"status": "ok", "operation": "task.list", "count": len(items), "items": items}
 
 
 def _task_show(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
-    config = _read_config(root)
-    path, task = _find_task(root, args.task_id)
-    if not _visible_task(task, config):
-        raise _error("task is outside the configured view sensitivity profile")
-    item = dict(task.fields)
-    item.update(record=path.relative_to(root).as_posix(), sha256=task.digest)
-    if args.include_body:
-        item["body"] = task.body
+    path, task = _find_task(root, args.task_id, metadata_only=not args.include_body)
+    item = _task_projection(path, task, root, include_body=args.include_body)
     return {"status": "ok", "operation": "task.show", "task": item}
 
 
@@ -1183,10 +1304,8 @@ def _task_update(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     path, task = _find_task(root, args.task_id)
-    if not _visible_task(task, config):
-        raise _error("task is outside the configured view sensitivity profile")
     updates: Dict[str, Any] = {}
-    for field in ("title", "outcome", "area", "type", "priority", "sensitivity", "next_action", "waiting_on"):
+    for field in ("title", "outcome", "area", "type", "priority", "sensitivity", "agent_access", "next_action", "waiting_on"):
         value = getattr(args, field, None)
         if value is not None:
             updates[field] = _parse_optional_field(value)
@@ -1198,6 +1317,8 @@ def _task_update(args: argparse.Namespace) -> Dict[str, Any]:
         updates["tags"] = [item for item in args.tags.split(",") if item]
     if args.aliases is not None:
         updates["aliases"] = [item for item in args.aliases.split(",") if item]
+    if any(field != "agent_access" for field in updates):
+        _require_agent_access(task.fields, "metadata", kind="task")
     if "area" in updates:
         configured_areas = {
             str(item.get("key"))
@@ -1211,6 +1332,11 @@ def _task_update(args: argparse.Namespace) -> Dict[str, Any]:
         new_rank = SENSITIVITY_RANK.get(str(updates["sensitivity"]), 99)
         if new_rank < old_rank:
             raise _error("lowering sensitivity requires an approved structural plan")
+    if "agent_access" in updates:
+        old_access = _record_agent_access(task.fields, "task")
+        new_access = str(updates["agent_access"])
+        if AGENT_ACCESS_RANK[new_access] > AGENT_ACCESS_RANK[old_access] and not (args.authorize_access and args.actor == "human"):
+            raise _error("raising agent_access requires --authorize-access with --actor human")
     if not updates:
         raise _error("task update requires at least one field")
     expected = args.expected_sha or task.digest
@@ -1239,8 +1365,7 @@ def _transition(args: argparse.Namespace, target: str) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     path, task = _find_task(root, args.task_id)
-    if not _visible_task(task, config):
-        raise _error("task is outside the configured view sensitivity profile")
+    _require_agent_access(task.fields, "metadata", kind="task")
     kwargs: Dict[str, Any] = {"now": _now_after(config, task.fields.get("updated_at"))}
     if target in {"completed", "cancelled"}:
         if not args.summary:
@@ -1366,6 +1491,7 @@ def _capture_create(args: argparse.Namespace) -> Dict[str, Any]:
         "payload_path": payload_path,
         "source": source_value,
         "sensitivity": args.sensitivity or config["default_sensitivity"],
+        "agent_access": args.agent_access or "metadata",
         "captured_at": timestamp,
         "updated_at": timestamp,
         "triaged_at": None,
@@ -1432,16 +1558,19 @@ def _capture_create(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _capture_list(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
-    config = _read_config(root)
     records = collect_records(root)["captures"]
-    max_rank = SENSITIVITY_RANK[config["view_max_sensitivity"]]
     items = []
     for raw in records:
-        if SENSITIVITY_RANK.get(raw.get("sensitivity"), 99) > max_rank:
-            continue
+        access = _record_agent_access(raw, "capture")
         if args.status and raw.get("status", raw.get("triage_state")) != args.status:
             continue
-        items.append(raw)
+        item = dict(raw)
+        item["agent_access"] = access
+        if access == "none":
+            allowed = {"kind", "schema_version", "capture_id", "id", "status", "capture_type", "sensitivity", "agent_access", "captured_at", "updated_at"}
+            item = {key: item[key] for key in allowed if key in item}
+            item["title"] = "[restricted]"
+        items.append(item)
     items.sort(key=lambda item: (str(item.get("captured_at") or ""), str(item.get("id") or item.get("capture_id") or "")))
     return {"status": "ok", "operation": "capture.list", "count": len(items), "items": items}
 
@@ -1538,6 +1667,7 @@ def _triage_plan(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     capture_path, capture = _find_capture(root, args.capture_id)
+    _require_agent_access(capture.fields, "metadata", kind="capture")
     if capture.fields["status"] != "inbox":
         raise _error("only inbox captures can be triaged")
     disposition = args.disposition
@@ -1576,6 +1706,7 @@ def _triage_plan(args: argparse.Namespace) -> Dict[str, Any]:
             "waiting_on": None,
             "follow_up_on": None,
             "sensitivity": capture.fields["sensitivity"],
+            "agent_access": "metadata",
             "created_at": timestamp,
             "updated_at": timestamp,
             "started_at": None,
@@ -1592,6 +1723,7 @@ def _triage_plan(args: argparse.Namespace) -> Dict[str, Any]:
         if not details["target_task"]:
             raise _error("attaching a capture requires --task-id, or omit it with disposition=task to create a task")
         target_path, target_task = _find_task(root, str(details["target_task"]))
+        _require_agent_access(target_task.fields, "metadata", kind="task")
         if target_task.fields["storage_state"] != "active":
             raise _error("cannot attach to an archived task")
         details["target_task_record"] = target_path.relative_to(root).as_posix()
@@ -1618,6 +1750,7 @@ def _artifact_fields(
     provenance: Mapping[str, Any],
     payload_path: Path,
     timestamp: str,
+    agent_access: str = "none",
 ) -> Dict[str, Any]:
     fields: Dict[str, Any] = {
         "kind": "artifact",
@@ -1627,6 +1760,7 @@ def _artifact_fields(
         "owner_task": owner_task,
         "role": role,
         "sensitivity": sensitivity,
+        "agent_access": agent_access,
         "provenance": dict(provenance),
         "sha256": _sha256_file(payload_path),
         "derived_from": [],
@@ -1646,6 +1780,7 @@ def _triage_apply(args: argparse.Namespace) -> Dict[str, Any]:
     if plan.get("operation") != "triage" or plan.get("workspace_id") != config["workspace_id"]:
         raise _error("triage plan targets another workspace")
     capture_path, capture = _find_capture(root, str(plan["capture_id"]))
+    _require_agent_access(capture.fields, "metadata", kind="capture")
     if capture.digest != plan.get("capture_sha256"):
         raise _error("capture changed after the plan was approved")
     disposition = str(plan["disposition"])
@@ -1699,6 +1834,7 @@ def _triage_apply(args: argparse.Namespace) -> Dict[str, Any]:
                 owner_task=owner,
                 role=role,
                 sensitivity=capture.fields["sensitivity"],
+                agent_access="none",
                 provenance={"kind": "capture", "capture_id": capture.fields["capture_id"], "source_sha256": capture.digest},
                 payload_path=payload_destination,
                 timestamp=timestamp,
@@ -1760,6 +1896,7 @@ def _archive_plan(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     path, task = _find_task(root, args.task_id)
+    _require_agent_access(task.fields, "metadata", kind="task")
     if task.fields["storage_state"] != "active" or task.fields["status"] not in {"completed", "cancelled"}:
         raise _error("only active completed/cancelled tasks can be archived")
     unresolved: List[str] = []
@@ -1825,6 +1962,7 @@ def _archive_apply(args: argparse.Namespace) -> Dict[str, Any]:
     if destination.exists() or destination.is_symlink():
         raise _error("archive destination exists after approval")
     _, task = _canonical_task_note(source, task_id)
+    _require_agent_access(task.fields, "metadata", kind="task")
     if task.digest != plan.get("task_sha256"):
         raise _error("canonical task note changed after archive approval")
     expected_destination = f"90_归档/{_area_folder(config, task.fields['area'])}/{str(task.fields['closed_at'])[:4]}/{task_id}"
@@ -1916,6 +2054,7 @@ def _restore_plan(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     path, task = _find_task(root, args.task_id)
+    _require_agent_access(task.fields, "metadata", kind="task")
     if task.fields["storage_state"] != "archived" or task.fields["status"] not in {"completed", "cancelled"}:
         raise _error("only archived completed/cancelled tasks can be restored")
     source = path.parent
@@ -1967,6 +2106,7 @@ def _restore_apply(args: argparse.Namespace) -> Dict[str, Any]:
     if destination.exists() or destination.is_symlink():
         raise _error("restore destination exists after approval")
     _, task = _canonical_task_note(source, task_id)
+    _require_agent_access(task.fields, "metadata", kind="task")
     if task.fields["storage_state"] != "archived" or task.digest != plan.get("task_sha256"):
         raise _error("archived task changed after restore approval")
     _validate_bundle_artifacts(root, source, task_id)
@@ -2045,10 +2185,20 @@ def _generate(args: argparse.Namespace) -> Dict[str, Any]:
     root = _root_path(args.root)
     config = _read_config(root)
     focus = args.focus or []
-    # ``None`` delegates profile selection to the canonical workspace config;
-    # an explicit CLI profile is an intentional narrower/wider projection.
-    profile = args.profile if args.profile is not None else None
-    return dict(generate_views(root, now=args.now or _today(config), profile=profile, focus_ids=focus), operation="views.generate")
+    return dict(generate_views(root, now=args.now or _today(config), profile=None, focus_ids=focus), operation="views.generate")
+
+
+def _export_views(args: argparse.Namespace) -> Dict[str, Any]:
+    root = _root_path(args.root)
+    config = _read_config(root)
+    output = Path(args.output).resolve()
+    if output == root or root in output.parents:
+        raise _error("export output must be outside the canonical workspace")
+    records = collect_records(root)
+    bundle = build_views(records["tasks"], records["captures"], now=args.now or _today(config), profile=args.profile, area_labels=_area_labels(config))
+    receipt = write_views(output, bundle)
+    receipt.update(operation="views.export", profile=bundle["profile"], output=str(output), source_sha256=bundle["source_sha256"])
+    return receipt
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2060,7 +2210,6 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--workspace-id")
     init.add_argument("--timezone", default="Asia/Shanghai")
     init.add_argument("--default-sensitivity", choices=tuple(SENSITIVITY_RANK), default="internal")
-    init.add_argument("--view-max-sensitivity", choices=tuple(SENSITIVITY_RANK), default="internal")
     init.add_argument("--area", action="append", help="KEY=LABEL=ARCHIVE_FOLDER")
     init.add_argument("--force", action="store_true")
     init.add_argument("--yes", action="store_true")
@@ -2080,6 +2229,7 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--scheduled-on")
     create.add_argument("--due-on")
     create.add_argument("--sensitivity", choices=tuple(SENSITIVITY_RANK))
+    create.add_argument("--agent-access", choices=tuple(AGENT_ACCESS_RANK), default="metadata")
     create.add_argument("--tags", action="append")
     create.add_argument("--aliases", action="append")
     create.add_argument("--body")
@@ -2100,10 +2250,11 @@ def _parser() -> argparse.ArgumentParser:
     update = task_sub.add_parser("update")
     update.add_argument("root")
     update.add_argument("--task-id", required=True)
-    for field in ("title", "outcome", "area", "type", "priority", "sensitivity", "next-action", "waiting-on", "scheduled-on", "due-on", "follow-up-on", "tags", "aliases"):
+    for field in ("title", "outcome", "area", "type", "priority", "sensitivity", "agent-access", "next-action", "waiting-on", "scheduled-on", "due-on", "follow-up-on", "tags", "aliases"):
         update.add_argument("--" + field)
     update.add_argument("--expected-sha")
     update.add_argument("--actor", default="agent")
+    update.add_argument("--authorize-access", action="store_true")
 
     for command_name, target in (("start", "active"), ("wait", "waiting"), ("block", "blocked"), ("complete", "completed"), ("cancel", "cancelled"), ("reopen", "active")):
         transition = task_sub.add_parser(command_name)
@@ -2127,6 +2278,7 @@ def _parser() -> argparse.ArgumentParser:
     create_capture.add_argument("--source")
     create_capture.add_argument("--capture-type", choices=("text", "file", "link", "email", "transcript", "other"), default="text")
     create_capture.add_argument("--sensitivity", choices=tuple(SENSITIVITY_RANK))
+    create_capture.add_argument("--agent-access", choices=tuple(AGENT_ACCESS_RANK), default="metadata")
     create_capture.add_argument("--tags", action="append")
     create_capture.add_argument("--actor", default="agent")
     create_capture.add_argument("--yes", action="store_true")
@@ -2159,8 +2311,28 @@ def _parser() -> argparse.ArgumentParser:
     generate = views_sub.add_parser("generate")
     generate.add_argument("root")
     generate.add_argument("--now")
-    generate.add_argument("--profile", choices=tuple(SENSITIVITY_RANK))
     generate.add_argument("--focus", action="append")
+    export = views_sub.add_parser("export")
+    export.add_argument("root")
+    export.add_argument("--profile", choices=tuple(SENSITIVITY_RANK), required=True)
+    export.add_argument("--output", required=True)
+    export.add_argument("--now")
+
+    artifact = sub.add_parser("artifact")
+    artifact_sub = artifact.add_subparsers(dest="artifact_command", required=True)
+    list_artifact = artifact_sub.add_parser("list")
+    list_artifact.add_argument("root")
+    show_artifact = artifact_sub.add_parser("show")
+    show_artifact.add_argument("root")
+    show_artifact.add_argument("--artifact-id", required=True)
+    show_artifact.add_argument("--include-payload", action="store_true")
+    update_artifact = artifact_sub.add_parser("update-access")
+    update_artifact.add_argument("root")
+    update_artifact.add_argument("--artifact-id", required=True)
+    update_artifact.add_argument("--agent-access", choices=tuple(AGENT_ACCESS_RANK), required=True)
+    update_artifact.add_argument("--expected-sha")
+    update_artifact.add_argument("--authorize-access", action="store_true")
+    update_artifact.add_argument("--actor", default="agent")
 
     archive = sub.add_parser("archive")
     archive_sub = archive.add_subparsers(dest="archive_command", required=True)
@@ -2223,8 +2395,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result = _triage_plan(args)
             else:
                 result = _triage_apply(args)
+        elif args.command == "artifact":
+            if args.artifact_command == "list":
+                result = _artifact_list(args)
+            elif args.artifact_command == "show":
+                result = _artifact_show(args)
+            else:
+                result = _artifact_update_access(args)
         elif args.command == "views":
-            result = _generate(args)
+            result = _generate(args) if args.views_command == "generate" else _export_views(args)
         elif args.command == "archive":
             if args.archive_command == "plan":
                 result = _archive_plan(args)

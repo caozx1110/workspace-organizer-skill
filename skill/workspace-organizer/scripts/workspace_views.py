@@ -18,7 +18,7 @@ surface is small so that the task/capture model can evolve independently:
     All rendering happens before the first replacement and a rollback is
     attempted if a replacement fails.
 
-``generate_views(root, now=None, profile="internal", focus_ids=())``
+``generate_views(root, now=None, profile=None, focus_ids=())``
     The normal end-to-end entry point used by the CLI.
 
 The generated pages are projections only.  They contain links and summaries,
@@ -47,6 +47,7 @@ VIEW_NAMES = ("TODAY", "NEXT", "INBOX", "WAITING", "ARCHIVE_INDEX")
 VIEW_RELATIVE_PATHS = {name: f"00_总览/{name}.md" for name in VIEW_NAMES}
 SENSITIVITY_ORDER = ("public", "internal", "confidential", "restricted")
 SENSITIVITY_RANK = {name: i for i, name in enumerate(SENSITIVITY_ORDER)}
+AGENT_ACCESSES = {"none", "metadata", "content"}
 PRIORITY_ORDER = ("urgent", "high", "normal", "low")
 PRIORITY_RANK = {name: i for i, name in enumerate(PRIORITY_ORDER)}
 OPEN_STATUSES = {"planned", "active", "waiting", "blocked"}
@@ -190,13 +191,21 @@ def _sensitivity(value: Any, field: str = "sensitivity") -> str:
     return str(value)
 
 
+def _agent_access(value: Any, field: str, *, default: str = "metadata") -> str:
+    if value is None:
+        return default
+    if value not in AGENT_ACCESSES:
+        raise ViewError(f"{field}: unknown access policy")
+    return str(value)
+
+
 def _profile_rank(profile: Any) -> tuple[str, int]:
     if profile is None:
-        profile = "internal"
+        return "cockpit", SENSITIVITY_RANK["restricted"]
     if isinstance(profile, Mapping):
         profile = profile.get(
             "max_sensitivity",
-            profile.get("view_max_sensitivity", profile.get("sensitivity", "internal")),
+            profile.get("sensitivity", "internal"),
         )
     if not isinstance(profile, str) or profile not in SENSITIVITY_RANK:
         raise ViewError("profile: must be public, internal, confidential, or restricted")
@@ -244,6 +253,7 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
     schema_version = raw.get("schema_version", SCHEMA_VERSION)
     if schema_version != SCHEMA_VERSION:
         raise ViewError("task record: unsupported schema_version")
+    agent_access = _agent_access(raw.get("agent_access"), "task.agent_access")
     task_id = _id(raw.get("id", raw.get("task_id")), "task.id")
     status = _text(raw.get("status"), "task.status", required=True, maximum=32)
     assert status is not None
@@ -303,6 +313,7 @@ def _normalize_task(raw: Mapping[str, Any]) -> dict[str, Any]:
         type=typ,
         priority=priority,
         sensitivity=sensitivity,
+        agent_access=agent_access,
         scheduled_on=scheduled_on,
         due_on=due_on,
         follow_up_on=follow_up_on,
@@ -320,6 +331,7 @@ def _normalize_capture(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ViewError("capture record: kind must be capture")
     if raw.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
         raise ViewError("capture record: unsupported schema_version")
+    agent_access = _agent_access(raw.get("agent_access"), "capture.agent_access")
     capture_id = _id(raw.get("id", raw.get("capture_id", raw.get("artifact_id"))), "capture.id")
     title = _text(raw.get("title", raw.get("summary", raw.get("name"))), f"capture {capture_id}.title", required=False, maximum=300)
     path_value = raw.get("path", raw.get("payload_path", raw.get("record_path")))
@@ -336,7 +348,7 @@ def _normalize_capture(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ViewError(f"capture {capture_id}: unknown triage state")
     sensitivity = _sensitivity(raw.get("sensitivity"), f"capture {capture_id}.sensitivity")
     result = dict(raw)
-    result.update(id=capture_id, title=title or (Path(path_value).stem if path_value else capture_id), path=path_value, captured_at=captured_at, triage_state=state, sensitivity=sensitivity)
+    result.update(id=capture_id, title=title or (Path(path_value).stem if path_value else capture_id), path=path_value, captured_at=captured_at, triage_state=state, sensitivity=sensitivity, agent_access=agent_access)
     return result
 
 
@@ -534,15 +546,17 @@ def build_views(
     captures: Iterable[Mapping[str, Any]] = (),
     *,
     now: Any = None,
-    profile: Any = "internal",
+    profile: Any = None,
     focus_ids: Iterable[str] = (),
     area_labels: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     """Render all five pages without touching the filesystem.
 
     The returned mapping has ``source_sha256`` and a ``files`` mapping of
-    workspace-relative output paths to UTF-8 bytes.  Records above the chosen
-    sensitivity profile are discarded before any other field is inspected.
+    workspace-relative output paths to UTF-8 bytes.  ``profile=None`` means a
+    private cockpit and includes every valid sensitivity.  An explicit profile
+    is a share/export projection; records above it are discarded before any
+    other field is inspected.
     """
 
     profile_name, profile_rank = _profile_rank(profile)
@@ -942,7 +956,7 @@ def collect_records(root: Union[str, os.PathLike[str]]) -> dict[str, list[dict[s
 def generate_views(
     root: Union[str, os.PathLike[str]],
     now: Any = None,
-    profile: Any = "internal",
+    profile: Any = None,
     focus_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Collect canonical records, render and commit all five pages."""
@@ -952,8 +966,6 @@ def generate_views(
     selected_focus = tuple(focus_ids) if focus_ids else _focus_from_user_file(root_path)
     config = _config_data(root_path)
     effective_profile = profile
-    if profile is None:
-        effective_profile = config.get("view_max_sensitivity", config.get("default_sensitivity", "internal"))
     bundle = build_views(
         records["tasks"],
         records["captures"],

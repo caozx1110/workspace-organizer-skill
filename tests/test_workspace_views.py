@@ -51,12 +51,28 @@ def capture(capture_id, *, title=None, sensitivity="internal", state="inbox", pa
 
 
 class ViewRenderingTests(unittest.TestCase):
+    def test_private_cockpit_includes_restricted_records(self):
+        restricted = task("secret", title="Private appointment", sensitivity="restricted", scheduled_on="2026-08-24")
+        bundle = views.build_views([restricted], now="2026-08-24")
+        self.assertEqual(bundle["profile"], "cockpit")
+        self.assertIn("Private appointment", bundle["files"]["00_总览/TODAY.md"].decode("utf-8"))
+        self.assertIn("Private appointment", bundle["files"]["00_总览/NEXT.md"].decode("utf-8"))
+
+    def test_visible_unknown_agent_access_fails_closed_but_hidden_export_record_is_ignored(self):
+        malformed = task("bad", title="Must not export")
+        malformed["agent_access"] = "mystery"
+        with self.assertRaisesRegex(views.ViewError, "agent_access"):
+            views.build_views([malformed], now="2026-08-24", profile="internal")
+        malformed["sensitivity"] = "restricted"
+        bundle = views.build_views([malformed], now="2026-08-24", profile="internal")
+        self.assertNotIn("Must not export", bundle["files"]["00_总览/NEXT.md"].decode("utf-8"))
+
     def test_deterministic_order_and_hidden_records_are_not_read_or_counted(self):
         visible_a = task("a", title="Alpha", priority="high", due_on="2026-08-26")
         visible_b = task("b", title="Beta", priority="urgent", due_on="2026-08-25")
         hidden = {"sensitivity": "confidential", "id": "hidden", "title": object()}  # malformed after the filter
-        first = views.build_views([visible_a, hidden, visible_b], [capture("inbox")], now="2026-08-24")
-        second = views.build_views([visible_b, visible_a, hidden], [capture("inbox")], now="2026-08-24")
+        first = views.build_views([visible_a, hidden, visible_b], [capture("inbox")], now="2026-08-24", profile="internal")
+        second = views.build_views([visible_b, visible_a, hidden], [capture("inbox")], now="2026-08-24", profile="internal")
         self.assertEqual(first["source_sha256"], second["source_sha256"])
         today = first["files"]["00_总览/TODAY.md"].decode("utf-8")
         self.assertIn("Beta", today)
@@ -67,8 +83,8 @@ class ViewRenderingTests(unittest.TestCase):
     def test_focus_does_not_duplicate_scheduled_task_and_hidden_focus_has_no_effect(self):
         focused = task("focus", title="Focused", scheduled_on="2026-08-24")
         hidden = task("secret", title="Secret", sensitivity="restricted", scheduled_on="2026-08-24")
-        first = views.build_views([focused, hidden], now="2026-08-24", focus_ids=["focus", "secret"])
-        second = views.build_views([focused, hidden], now="2026-08-24", focus_ids=["focus"])
+        first = views.build_views([focused, hidden], now="2026-08-24", focus_ids=["focus", "secret"], profile="internal")
+        second = views.build_views([focused, hidden], now="2026-08-24", focus_ids=["focus"], profile="internal")
         self.assertEqual(first["source_sha256"], second["source_sha256"])
         today = first["files"]["00_总览/TODAY.md"].decode("utf-8")
         self.assertEqual(today.count("[Focused]"), 1)
@@ -183,7 +199,6 @@ class ViewRenderingTests(unittest.TestCase):
                 "schema_version: 2\n"
                 "timezone: Asia/Shanghai\n"
                 "default_sensitivity: internal\n"
-                "view_max_sensitivity: internal\n"
                 'areas: [{"key":"ops","label":"运营","archive_folder":"运营"}]\n',
                 encoding="utf-8",
             )
@@ -209,10 +224,10 @@ class ViewRenderingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             receipt = views.generate_views(root, now="2026-08-24", profile=None)
-            self.assertEqual(receipt["profile"], "internal")
+            self.assertEqual(receipt["profile"], "cockpit")
             next_page = (root / "00_总览/NEXT.md").read_text(encoding="utf-8")
             self.assertIn("运营", next_page)
-            self.assertNotIn("Confidential", next_page)
+            self.assertIn("Confidential", next_page)
             self.assertNotIn("secret", next_page)
             self.assertNotIn("Vendor secret", next_page)
 
