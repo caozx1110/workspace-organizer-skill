@@ -30,6 +30,7 @@ python3 "$WO" init /path/to/vault --yes
 python3 "$WO" task create /path/to/vault --title "Renew passport" --outcome "Receive the receipt" --yes
 python3 "$WO" capture create /path/to/vault --text "Supplier sent a contract" --yes
 python3 "$WO" views generate /path/to/vault
+python3 "$WO" views export /path/to/vault --profile internal --output /path/to/share
 ```
 
 A Capture is not a Task. Triage, attachment, library promotion, archive, and
@@ -39,4 +40,22 @@ it, and verify the result. An uncertain owner or sensitivity stays in Inbox.
 Humans may edit Task bodies and HOME/FOCUS directly. Agent metadata edits use CAS,
 so an Obsidian save made after the read becomes a visible conflict instead of a
 last-write-wins overwrite. Generated pages replace only their own marker; HOME and
-FOCUS are never replaced. The default profile exposes at most `internal` records.
+FOCUS are never replaced. The private cockpit includes valid records through
+`restricted`; only explicit `views export` applies a sensitivity profile before
+counting, sorting, or rendering. Never publish the cockpit directory itself.
+
+`sensitivity` describes disclosure harm, while `agent_access` controls Agent
+reading. `none` returns a minimal stub with a `[restricted]` title; `metadata`
+(the Task/Capture default) allows scheduling and lifecycle updates but not the
+body; `content` is required for `task show --include-body`. Artifacts default to
+`none` and require their own `content` grant even when the owning Task grants
+content. Raising access requires explicit human authorization:
+
+```sh
+python3 "$WO" task update /path/to/vault --task-id ID --agent-access content --authorize-access --actor human
+python3 "$WO" artifact update-access /path/to/vault --artifact-id ID --agent-access content --authorize-access --actor human
+```
+
+Sensitivity is chosen explicitly by the human or an accepted workspace rule;
+it is not guessed from body keywords. If owner, purpose, or sensitivity is
+uncertain, leave the input in Inbox as `restricted` until a human confirms it.

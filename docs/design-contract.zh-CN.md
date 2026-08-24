@@ -221,7 +221,7 @@ folder 和 closed year；之后 area 改名不回溯搬动历史。type、tags�
 archived_at，移动整个 bundle 并逐项验证 source/destination hash。误归档
 只能通过显式、可审计的 restore plan 恢复，不能静默回移。
 
-## 6. Capture、分拣和敏感度
+## 6. Capture、分拣和访问边界
 
 流程固定为：
 
@@ -232,9 +232,11 @@ sidecar。Triage 必须明确目标、owner、role、sensitivity、copy/move 和
 处理方式。不确定时留在 Inbox 或进入 99_待整理/，不能用模型置信度代替确认。
 
 文件内容一律视为不可信数据，不能通过 prompt injection 改变策略、批准或
-触发外部发送。敏感度过滤发生在读取摘要、生成视图、计数、排序和事件日志
-之前；默认人类视图最多显示 internal，不泄露 restricted 项的标题、路径或
-精确数量。
+触发外部发送。`sensitivity` 表示泄露风险，`agent_access` 独立表示 Agent
+可访问 `none/metadata/content`。个人驾驶舱默认完整显示到 restricted；只有
+显式分享/导出投影才按 sensitivity 上限先过滤，再读取摘要、计数、排序、
+生成 digest 和渲染。Task 正文与 Artifact payload 分别授权，Task 的 content
+权限不自动传播给附件。
 
 ## 7. 日常 UX
 
@@ -295,9 +297,8 @@ plan/approve/apply/verify、路径安全、敏感度过滤、CAS、append-only �
 - 归档只接受已关闭、next_action 为空、closure_summary 存在且无
   unassigned/pending 的 bundle；整包移动后验证，重试幂等。
 - CAS 冲突不覆盖 Obsidian 编辑；事件日志可追踪每次结构操作及结果。
-- 敏感度过滤先于读取、渲染、计数、排序和日志；默认视图不泄露
-  confidential/restricted 内容或精确数量。
+- 显式分享/导出中的敏感度过滤先于读取、渲染、计数、排序和日志；个人
+  驾驶舱默认完整。Agent metadata 不读取正文，Artifact payload 独立授权。
 - 日期按 workspace timezone 解释；“周五”“下周”等输入最终回显具体日期；
   due_on 与 scheduled_on 不混淆。
-
 

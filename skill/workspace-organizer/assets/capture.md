@@ -8,6 +8,7 @@ capture_type: text
 payload_path: null
 source: "manual"
 sensitivity: internal
+agent_access: metadata
 captured_at: "2026-08-24T14:00:00+08:00"
 updated_at: "2026-08-24T14:00:00+08:00"
 triaged_at: null

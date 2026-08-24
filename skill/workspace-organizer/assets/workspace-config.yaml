@@ -3,5 +3,4 @@ schema_version: 2
 workspace_id: example-workspace
 timezone: Asia/Shanghai
 default_sensitivity: internal
-view_max_sensitivity: internal
 areas: [{"key": "general", "label": "通用", "archive_folder": "通用"}]

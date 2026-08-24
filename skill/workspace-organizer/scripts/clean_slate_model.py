@@ -52,6 +52,25 @@ CLOSED_STATUSES = frozenset({"completed", "cancelled"})
 TASK_STATUSES = OPEN_STATUSES | CLOSED_STATUSES
 PRIORITIES = frozenset({"urgent", "high", "normal", "low"})
 SENSITIVITIES = frozenset({"public", "internal", "confidential", "restricted"})
+AGENT_ACCESSES = frozenset({"none", "metadata", "content"})
+
+
+def default_agent_access(kind: str) -> str:
+    """Return the least-privilege migration default for a record kind."""
+
+    return "none" if kind == "artifact" else "metadata"
+
+
+def effective_agent_access(data: Mapping[str, Any], *, kind: Optional[str] = None) -> str:
+    """Return an explicit access policy or its safe kind-specific default."""
+
+    record_kind = kind or str(data.get("kind") or "")
+    value = data.get("agent_access")
+    if value is None:
+        return default_agent_access(record_kind)
+    if value not in AGENT_ACCESSES:
+        raise ValidationError(f"{record_kind or 'record'}.agent_access: unknown access policy")
+    return str(value)
 
 # The graph intentionally has no ``archived`` business status.  Storage state
 # is handled by archive/restore helpers below.
@@ -966,6 +985,8 @@ def validate_task(data: Mapping[str, Any], context: str = "task") -> None:
     parse_date(data["due_on"], f"{context}.due_on")
     parse_date(data["follow_up_on"], f"{context}.follow_up_on")
     _validate_choice(data["sensitivity"], SENSITIVITIES, f"{context}.sensitivity")
+    if "agent_access" in data:
+        _validate_choice(data["agent_access"], AGENT_ACCESSES, f"{context}.agent_access")
     for key in ("created_at", "updated_at", "started_at", "closed_at", "archived_at"):
         parse_timestamp(data[key], f"{context}.{key}")
     if data["created_at"] is None or data["updated_at"] is None:
@@ -1027,6 +1048,8 @@ def validate_capture(data: Mapping[str, Any], context: str = "capture") -> None:
     else:
         _validate_mapping_strings(source, f"{context}.source")
     _validate_choice(normalized["sensitivity"], SENSITIVITIES, f"{context}.sensitivity")
+    if "agent_access" in normalized:
+        _validate_choice(normalized["agent_access"], AGENT_ACCESSES, f"{context}.agent_access")
     captured = parse_timestamp(normalized["captured_at"], f"{context}.captured_at")
     updated = parse_timestamp(normalized["updated_at"], f"{context}.updated_at")
     triaged = parse_timestamp(normalized["triaged_at"], f"{context}.triaged_at")
@@ -1109,6 +1132,8 @@ def validate_artifact(data: Mapping[str, Any], context: str = "artifact") -> Non
     if role in {"library", "inbox"} and owner is not None:
         raise ValidationError(f"{context}.owner_task: must be null for role {role!r}")
     _validate_choice(normalized["sensitivity"], SENSITIVITIES, f"{context}.sensitivity")
+    if "agent_access" in normalized:
+        _validate_choice(normalized["agent_access"], AGENT_ACCESSES, f"{context}.agent_access")
     provenance = normalized["provenance"]
     if provenance is None or provenance == "":
         raise ValidationError(f"{context}.provenance: required")
@@ -1807,6 +1832,9 @@ __all__ = [
     "TRANSITIONS",
     "PRIORITIES",
     "SENSITIVITIES",
+    "AGENT_ACCESSES",
+    "default_agent_access",
+    "effective_agent_access",
     "ARTIFACT_ROLES",
     "CAPTURE_STATUSES",
     "CAPTURE_TYPES",

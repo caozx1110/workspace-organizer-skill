@@ -88,6 +88,7 @@ class CleanSlateCliE2ETests(unittest.TestCase):
         scheduled_on: Optional[str] = None,
         due_on: Optional[str] = None,
         body: Optional[str] = None,
+        agent_access: Optional[str] = None,
     ) -> Dict[str, Any]:
         args = [
             "task",
@@ -108,6 +109,8 @@ class CleanSlateCliE2ETests(unittest.TestCase):
             args.extend(("--due-on", due_on))
         if body is not None:
             args.extend(("--body", body))
+        if agent_access is not None:
+            args.extend(("--agent-access", agent_access))
         args.append("--yes")
         _, result = self.run_cli(*args)
         assert result is not None
@@ -270,6 +273,7 @@ class CleanSlateCliE2ETests(unittest.TestCase):
             "task-lifecycle",
             "Lifecycle task",
             body="# Lifecycle task\n\nUser notes remain intact.\n",
+            agent_access="content",
         )
         note = self.root / created["record"]
         first_sha = created["sha256"]
@@ -558,10 +562,10 @@ class CleanSlateCliE2ETests(unittest.TestCase):
         waiting = (self.root / "00_总览/WAITING.md").read_text(encoding="utf-8")
         inbox = (self.root / "00_总览/INBOX.md").read_text(encoding="utf-8")
         self.assertIn("Today task", today)
-        self.assertNotIn("Confidential task", today)
+        self.assertIn("Confidential task", today)
         self.assertIn("Today task", next_page)
         self.assertIn("Waiting task", next_page)
-        self.assertNotIn("Confidential task", next_page)
+        self.assertIn("Confidential task", next_page)
         self.assertIn("Vendor", waiting)
         self.assertIn("inbox-item", inbox)
 
@@ -569,6 +573,80 @@ class CleanSlateCliE2ETests(unittest.TestCase):
         assert second is not None
         self.assertEqual(second["status"], "unchanged")
         self.assertEqual(second["source_sha256"], generated["source_sha256"])
+
+        export_root = self.root.parent / "shared-internal"
+        _, exported = self.run_cli(
+            "views", "export", str(self.root), "--profile", "internal",
+            "--output", str(export_root), "--now", "2026-08-24",
+        )
+        assert exported is not None
+        exported_today = (export_root / "00_总览/TODAY.md").read_text(encoding="utf-8")
+        self.assertNotIn("Confidential task", exported_today)
+        self.assertEqual(exported["profile"], "internal")
+
+    def test_agent_access_gates_body_lifecycle_and_artifact_payload(self) -> None:
+        self.init_workspace()
+        self.create_task("opaque-task", "Opaque title", status="active", agent_access="none")
+        opaque_list = self.run_cli("task", "list", str(self.root))[1]
+        assert opaque_list is not None
+        opaque = next(item for item in opaque_list["items"] if item["id"] == "opaque-task")
+        self.assertEqual(opaque["title"], "[restricted]")
+        self.assertNotIn("record", opaque)
+        denied_transition, _ = self.run_cli("task", "wait", str(self.root), "--task-id", "opaque-task", "--waiting-on", "Owner", check=False)
+        self.assertNotEqual(denied_transition.returncode, 0)
+        self.run_cli(
+            "task", "update", str(self.root), "--task-id", "opaque-task", "--agent-access", "metadata",
+            "--authorize-access", "--actor", "human",
+        )
+        granted_transition = self.run_cli("task", "wait", str(self.root), "--task-id", "opaque-task", "--waiting-on", "Owner")[1]
+        assert granted_transition is not None
+        self.assertEqual(granted_transition["to"], "waiting")
+
+        self.create_task("metadata-task", "Metadata task", status="active", body="Private body")
+        denied, payload = self.run_cli(
+            "task", "show", str(self.root), "--task-id", "metadata-task", "--include-body", check=False,
+        )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIsNone(payload)
+        self.assertIn("content", denied.stderr)
+        transitioned = self.run_cli("task", "wait", str(self.root), "--task-id", "metadata-task", "--waiting-on", "Owner")[1]
+        assert transitioned is not None
+        self.assertEqual(transitioned["to"], "waiting")
+
+        denied_grant, _ = self.run_cli(
+            "task", "update", str(self.root), "--task-id", "metadata-task", "--agent-access", "content", check=False,
+        )
+        self.assertNotEqual(denied_grant.returncode, 0)
+        self.run_cli(
+            "task", "update", str(self.root), "--task-id", "metadata-task", "--agent-access", "content",
+            "--authorize-access", "--actor", "human",
+        )
+        shown = self.run_cli("task", "show", str(self.root), "--task-id", "metadata-task", "--include-body")[1]
+        assert shown is not None
+        self.assertIn("Private body", shown["task"]["body"])
+
+        source = self.root.parent / "access-payload.txt"
+        source.write_text("payload secret", encoding="utf-8")
+        self.run_cli("capture", "create", str(self.root), "--id", "access-capture", "--file", str(source), "--yes")
+        plan = self.root / "access.plan.json"
+        self.run_cli("capture", "triage", str(self.root), "--capture-id", "access-capture", "--disposition", "artifact", "--task-id", "metadata-task", "--output", str(plan))
+        approval = self.root / "access.approval.json"
+        self.approve(plan, approval)
+        triaged = self.run_cli("capture", "triage-apply", str(self.root), "--plan", str(plan), "--approval", str(approval))[1]
+        assert triaged is not None
+        artifact_id = triaged["artifact"]["artifact_id"]
+        denied_payload, _ = self.run_cli("artifact", "show", str(self.root), "--artifact-id", artifact_id, "--include-payload", check=False)
+        self.assertNotEqual(denied_payload.returncode, 0)
+        listed = self.run_cli("artifact", "list", str(self.root))[1]
+        assert listed is not None
+        self.assertNotIn("payload_path", listed["items"][0])
+        self.run_cli(
+            "artifact", "update-access", str(self.root), "--artifact-id", artifact_id,
+            "--agent-access", "content", "--authorize-access", "--actor", "human",
+        )
+        allowed = self.run_cli("artifact", "show", str(self.root), "--artifact-id", artifact_id, "--include-payload")[1]
+        assert allowed is not None
+        self.assertEqual(allowed["artifact"]["payload_base64"], "cGF5bG9hZCBzZWNyZXQ=")
 
     def test_archive_and_restore_round_trip_rewrites_artifact_custody(self) -> None:
         self.init_workspace()

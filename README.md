@@ -6,9 +6,15 @@ until a deliberate triage decision. Canonical state is human-readable Markdown,
 generated pages are disposable projections, and archive/restore operations are
 audited and recoverable.
 
+The private cockpit includes all sensitivity levels. Agent access is a separate
+`none/metadata/content` policy, and filtered output is produced only through an
+explicit export profile.
+
 中文简介：这是面向 Obsidian 与 Chat/Agent 的 clean-slate 混合式工作区管理技能。
 Task 表示一个可交付结果，Capture 与文件 Artifact 在明确分拣前保持独立；Markdown
 是唯一事实来源，视图可以重建，归档和恢复必须经过可审计的精确批准。
+个人驾驶舱默认完整；Agent 访问采用独立的 `none/metadata/content` 权限，只有
+显式导出才按敏感度过滤。
 
 - [English installation and user guide](docs/guide.en.md)
 - [中文安装与使用指南](docs/guide.zh-CN.md)
