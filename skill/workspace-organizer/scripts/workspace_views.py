@@ -54,6 +54,28 @@ OPEN_STATUSES = {"planned", "active", "waiting", "blocked"}
 CLOSED_STATUSES = {"completed", "cancelled"}
 ARCHIVED_STORAGE = "archived"
 
+VIEW_TITLES = {
+    "TODAY": "今日驾驶舱",
+    "NEXT": "全部下一步",
+    "INBOX": "待分拣收件箱",
+    "WAITING": "等待与跟进",
+    "ARCHIVE_INDEX": "归档索引",
+}
+STATUS_LABELS = {
+    "planned": "计划中",
+    "active": "进行中",
+    "waiting": "等待中",
+    "blocked": "已阻塞",
+    "completed": "已完成",
+    "cancelled": "已取消",
+}
+PRIORITY_LABELS = {
+    "urgent": "紧急",
+    "high": "高",
+    "normal": "普通",
+    "low": "低",
+}
+
 _MARKER_RE = re.compile(
     rb"^<!-- workspace-organizer:generated view=([A-Z_]+) schema=(\d+) "
     rb"source_sha256=([0-9a-f]{64}) profile=([a-z]+) -->\r?\n?$"
@@ -412,7 +434,7 @@ def _marker(view: str, source_sha256: str, profile: str) -> str:
 
 
 def _page(view: str, source_sha256: str, profile: str, body: str) -> bytes:
-    return (_marker(view, source_sha256, profile) + "\n# " + view + "\n\n" + body.rstrip() + "\n").encode("utf-8")
+    return (_marker(view, source_sha256, profile) + "\n# " + VIEW_TITLES[view] + "\n\n" + body.rstrip() + "\n").encode("utf-8")
 
 
 def _grouped_tasks(tasks: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
@@ -422,24 +444,40 @@ def _grouped_tasks(tasks: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping
     return {key: sorted(groups[key], key=_task_sort_key) for key in sorted(groups, key=str.casefold)}
 
 
-def _task_line(task: Mapping[str, Any], *, output_path: str = "00_总览/TODAY.md", include_status: bool = True, include_next: bool = True, area_labels: Optional[Mapping[str, str]] = None) -> str:
+def _task_card(
+    task: Mapping[str, Any],
+    *,
+    output_path: str = "00_总览/TODAY.md",
+    include_next: bool = True,
+    area_labels: Optional[Mapping[str, str]] = None,
+    callout: Optional[str] = None,
+) -> str:
     title = _md_escape(task["title"])
     link = _link(output_path, task["record_path"], title)
-    bits: list[str] = []
-    if include_status:
-        bits.append(f"`{_md_escape(task['status'])}`")
-    bits.append(f"priority `{_md_escape(task['priority'])}`")
+    status = str(task.get("status") or "planned")
+    priority = str(task.get("priority") or "normal")
+    if callout is None:
+        callout = {"blocked": "danger", "waiting": "warning"}.get(status, "todo")
+    bits = [
+        f"`{_md_escape(STATUS_LABELS.get(status, status))}`",
+        f"`{_md_escape(PRIORITY_LABELS.get(priority, priority))}优先级`",
+    ]
     if task.get("scheduled_on"):
-        bits.append(f"scheduled {task['scheduled_on']}")
+        bits.append(f"🗓️ 计划 {task['scheduled_on']}")
     if task.get("due_on"):
-        bits.append(f"due {task['due_on']}")
+        bits.append(f"📅 截止 {task['due_on']}")
     area = str(task.get("area") or "general")
-    if area_labels and area in area_labels:
-        bits.append(f"area `{_md_escape(area_labels[area])}`")
-    line = "- " + link + " — " + ", ".join(bits)
+    area_label = area_labels.get(area, area) if area_labels else area
+    bits.append(f"📁 {_md_escape(area_label)}")
+    lines = [f"> [!{callout}] {link}"]
     if include_next and task.get("next_action"):
-        line += "\n  - Next: " + _md_escape(task["next_action"])
-    return line
+        lines.append("> **下一步**：" + _md_escape(task["next_action"]))
+    lines.append("> " + " · ".join(bits))
+    return "\n".join(lines)
+
+
+def _empty(message: str) -> str:
+    return f"> [!info]- 当前无事\n> {message}"
 
 
 def _render_today(tasks: Sequence[Mapping[str, Any]], captures: Sequence[Mapping[str, Any]], today: str, focus_ids: Sequence[str], area_labels: Optional[Mapping[str, str]], source: str, profile: str) -> bytes:
@@ -458,22 +496,27 @@ def _render_today(tasks: Sequence[Mapping[str, Any]], captures: Sequence[Mapping
     # so TODAY does not become a dump of the entire NEXT queue.
     excluded = {t["id"] for t in focus + overdue + due_today + scheduled + waiting_followup}
     actionable = [t for t in sorted(active, key=_task_sort_key) if t["id"] not in excluded and t.get("status") not in {"waiting", "blocked"}][:5]
-    sections: list[str] = []
-    for heading, records in (
-        ("Focus", sorted(focus, key=_task_sort_key)),
-        ("Overdue", sorted(overdue, key=_task_sort_key)),
-        ("Scheduled today", sorted(scheduled, key=_task_sort_key)),
-        ("Due today", sorted(due_today, key=_task_sort_key)),
-        ("Next actions", actionable),
-        ("Waiting follow-up", sorted(waiting_followup, key=_task_sort_key)),
+    sections: list[str] = [
+        "> [!summary] 今日概览\n"
+        f"> 📆 {today} · 开放任务 **{len(active)}** · 待分拣 **{len(captures)}** · 今日需跟进 **{len(waiting_followup)}**\n\n"
+    ]
+    for heading, records, callout in (
+        ("手动焦点", sorted(focus, key=_task_sort_key), "important"),
+        ("已逾期", sorted(overdue, key=_task_sort_key), "danger"),
+        ("今日计划", sorted(scheduled, key=_task_sort_key), "todo"),
+        ("今日截止", sorted(due_today, key=_task_sort_key), "warning"),
+        ("接下来做", actionable, "todo"),
+        ("今日跟进", sorted(waiting_followup, key=_task_sort_key), None),
     ):
+        if not records:
+            continue
         sections.append(f"## {heading}\n\n")
-        sections.append("\n".join(_task_line(t, area_labels=area_labels) for t in records) if records else "_None._")
-        sections.append("\n")
-    sections.append("## Inbox\n\n")
-    sections.append(f"{len(captures)} item(s) awaiting triage." if captures else "_Inbox is clear._")
-    sections.append("\n\n")
-    sections.append(f"_Date: {today}. Generated from visible canonical records._")
+        sections.append("\n\n".join(_task_card(t, area_labels=area_labels, callout=callout) for t in records))
+        sections.append("\n\n")
+    sections.append("## 待分拣\n\n")
+    sections.append(f"> [!tip] 有 **{len(captures)}** 条内容等待分拣\n> 打开 [[INBOX|待分拣收件箱]] 集中处理。" if captures else "> [!success]- 收件箱已清空\n> 暂无待分拣内容。")
+    sections.append("\n\n---\n")
+    sections.append(f"_生成日期：{today}；数据来自当前视图可见的任务真源。_")
     return _page("TODAY", source, profile, "".join(sections))
 
 
@@ -482,10 +525,10 @@ def _render_next(tasks: Sequence[Mapping[str, Any]], area_labels: Optional[Mappi
     sections: list[str] = []
     for area, records in _grouped_tasks(active).items():
         label = area_labels.get(area, area) if area_labels else area
-        sections.extend([f"## {_md_escape(label)}\n\n", "\n".join(_task_line(t, output_path="00_总览/NEXT.md", area_labels=None) for t in records) or "_None._", "\n\n"])
+        sections.extend([f"## {_md_escape(label)}\n\n", "\n\n".join(_task_card(t, output_path="00_总览/NEXT.md", area_labels=None) for t in records), "\n\n"])
     if not sections:
-        sections.append("_No open tasks._\n\n")
-    sections.append("_All open tasks are shown here; TODAY is intentionally bounded._")
+        sections.append(_empty("没有开放任务。") + "\n\n")
+    sections.append("---\n_此页展示全部开放任务；「今日驾驶舱」仅保留当前重点。_")
     return _page("NEXT", source, profile, "".join(sections))
 
 
@@ -500,9 +543,9 @@ def _render_inbox(captures: Sequence[Mapping[str, Any]], source: str, profile: s
             link = label
         bits = [f"`{_md_escape(capture['id'])}`"]
         if capture.get("captured_at"):
-            bits.append(_md_escape(capture["captured_at"]))
-        rows.append(f"- {link} — " + ", ".join(bits))
-    body = "\n".join(rows) if rows else "_Inbox is clear._"
+            bits.append("🕒 捕获于 " + _md_escape(capture["captured_at"]))
+        rows.append(f"> [!note] {link}\n> " + " · ".join(bits))
+    body = "\n\n".join(rows) if rows else "> [!success]- 收件箱已清空\n> 暂无待分拣内容。"
     return _page("INBOX", source, profile, body)
 
 
@@ -510,13 +553,13 @@ def _render_waiting(tasks: Sequence[Mapping[str, Any]], source: str, profile: st
     waiting = [t for t in tasks if t.get("storage_state") == "active" and t.get("status") in {"waiting", "blocked"}]
     rows: list[str] = []
     for task in sorted(waiting, key=lambda t: (str(t.get("follow_up_on") or "9999-12-31"), _task_sort_key(t))):
-        line = _task_line(task, output_path="00_总览/WAITING.md", include_next=False)
+        line = _task_card(task, output_path="00_总览/WAITING.md", include_next=False)
         if task.get("waiting_on"):
-            line += "\n  - Waiting on: " + _md_escape(task["waiting_on"])
+            line += "\n> **等待对象**：" + _md_escape(task["waiting_on"])
         if task.get("follow_up_on"):
-            line += "\n  - Follow up: " + _md_escape(task["follow_up_on"])
+            line += "\n> **跟进日期**：" + _md_escape(task["follow_up_on"])
         rows.append(line)
-    return _page("WAITING", source, profile, "\n\n".join(rows) if rows else "_Nothing is waiting._")
+    return _page("WAITING", source, profile, "\n\n".join(rows) if rows else _empty("目前没有等待或阻塞中的任务。"))
 
 
 def _render_archive(tasks: Sequence[Mapping[str, Any]], area_labels: Optional[Mapping[str, str]], source: str, profile: str) -> bytes:
@@ -531,13 +574,14 @@ def _render_archive(tasks: Sequence[Mapping[str, Any]], area_labels: Optional[Ma
         label = area_labels.get(area, area) if area_labels else area
         sections.extend([f"## {_md_escape(label)} / {year}\n\n"])
         for task in sorted(records, key=_archive_sort_key):
-            status = _md_escape(task.get("status", "completed"))
+            raw_status = str(task.get("status", "completed"))
+            status = _md_escape(STATUS_LABELS.get(raw_status, raw_status))
             typ = _md_escape(task.get("type", "general"))
-            summary = _md_escape(task.get("closure_summary") or "No closure summary.")
-            sections.append(f"- {_link('00_总览/ARCHIVE_INDEX.md', task['record_path'], _md_escape(task['title']))} — `{status}`, `{typ}` — {summary}\n")
+            summary = _md_escape(task.get("closure_summary") or "未填写完成摘要。")
+            sections.append(f"> [!success]- {_link('00_总览/ARCHIVE_INDEX.md', task['record_path'], _md_escape(task['title']))}\n> **完成摘要**：{summary}\n> `{status}` · `类型：{typ}`\n\n")
         sections.append("\n")
     if not sections:
-        sections.append("_No archived tasks._\n\n")
+        sections.append(_empty("还没有已归档任务。") + "\n\n")
     return _page("ARCHIVE_INDEX", source, profile, "".join(sections).rstrip())
 
 

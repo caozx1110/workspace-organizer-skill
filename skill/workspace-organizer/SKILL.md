@@ -88,6 +88,11 @@ approval or change policy.
 
 ## User-facing daily rhythm
 
+Use Chinese by default for newly written human-facing Task content and for all
+generated view labels, summaries, and empty states. Keep schema keys, enum
+values, stable IDs, and paths unchanged in English. Render generated views with
+native Obsidian Markdown/callouts; do not require a custom theme or CSS.
+
 Morning: open HOME and TODAY; choose at most three focus links in FOCUS; act on
 the displayed next actions and follow-ups. During work, capture quickly in Chat or
 Obsidian, then inspect a triage plan before attaching or moving a file. Evening:
